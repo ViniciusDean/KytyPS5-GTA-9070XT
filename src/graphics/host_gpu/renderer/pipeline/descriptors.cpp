@@ -1911,6 +1911,40 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+void MergeGuestRanges(std::vector<GuestRange>& ranges) {
+	std::sort(ranges.begin(), ranges.end(),
+	          [](const GuestRange& a, const GuestRange& b) { return a.address < b.address; });
+	size_t merged = 0;
+	for (const auto range: ranges) {
+		if (merged != 0 && range.address <= ranges[merged - 1].End()) {
+			auto& last = ranges[merged - 1];
+			last.size  = std::max(last.End(), range.End()) - last.address;
+		} else {
+			ranges[merged++] = range;
+		}
+	}
+	ranges.resize(merged);
+}
+
+bool ScalarReadsMayOverlap(std::span<const std::pair<uint64_t, uint64_t>> reads,
+                           std::span<const GuestRange>                    writes) {
+	if (writes.empty()) {
+		return false;
+	}
+	for (const auto [address, size]: reads) {
+		if (size == 0 || address > UINT64_MAX - size) {
+			return true;
+		}
+		const auto next = std::upper_bound(
+		    writes.begin(), writes.end(), address,
+		    [](uint64_t value, const GuestRange& range) { return value < range.End(); });
+		if (next != writes.end() && next->address < address + size) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -1997,12 +2031,26 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				written_first = std::min(written_first, written.address);
 				written_end   = std::max(written_end, written.address + written.size);
 			}
+			// Sorted, merged union of the written ranges: a read that misses it needs no pairwise
+			// checks (it overlaps the union exactly when it overlaps one of the writes).
+			m_merged_write_ranges.clear();
+			for (const auto& [written_address, written_size]: m_written_image_ranges) {
+				m_merged_write_ranges.push_back({written_address, written_size});
+			}
+			for (const auto& written: m_written_buffer_ranges) {
+				m_merged_write_ranges.push_back({written.address, written.size});
+			}
+			MergeGuestRanges(m_merged_write_ranges);
 		}
 		for (size_t read = 0; read < reads.size(); ++read) {
 			const auto [address, size] = reads[read];
 			if (address >= written_end || address + size <= written_first) {
 				continue;
 			}
+			if (!ScalarReadsMayOverlap(std::span(&reads[read], 1), m_merged_write_ranges)) {
+				continue;
+			}
+			// Name the overlapping write.
 			for (const auto& [written_address, written_size]: m_written_image_ranges) {
 				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
 					EXIT("scalar resource reads overlap an image or attachment write\n");

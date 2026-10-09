@@ -539,6 +539,8 @@ private:
 		uint32_t                resource = 0;
 	};
 	std::vector<WrittenBufferRange> m_written_buffer_ranges;
+	// CommitBindings(): the union of both, sorted and merged; see ScalarReadsMayOverlap().
+	std::vector<GuestRange>         m_merged_write_ranges;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	// Prepared bindings and slot memos point into the elements: a deque never relocates its
@@ -599,6 +601,12 @@ private:
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
 };
+
+// Sorts nonempty ranges and merges those that overlap or touch.
+void MergeGuestRanges(std::vector<GuestRange>& ranges);
+// True when a scalar read is invalid or overlaps one of the sorted, disjoint written ranges.
+[[nodiscard]] bool ScalarReadsMayOverlap(std::span<const std::pair<uint64_t, uint64_t>> reads,
+                                         std::span<const GuestRange>                    writes);
 
 [[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
