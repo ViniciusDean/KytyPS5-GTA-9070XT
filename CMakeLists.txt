@@ -741,6 +741,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME indirect_write_tables
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-write-tables-only)
+	add_test(NAME texture_cache_imageless_invalidation
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --imageless-invalidation-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
