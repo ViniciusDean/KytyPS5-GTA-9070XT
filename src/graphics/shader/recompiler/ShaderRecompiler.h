@@ -23,6 +23,7 @@ struct CompileOptions {
 	bool                        early_dump                 = false;
 	bool                        emit_debug_info            = false;
 	bool                        maintenance8_enabled       = false;
+	bool                        robust_buffer_access2      = false;
 	const char*                 dump_label                 = nullptr;
 	// Replace known guest BVH traversal loops with host ray queries (see RayTracingPatch.h).
 	bool                        native_ray_tracing         = false;
