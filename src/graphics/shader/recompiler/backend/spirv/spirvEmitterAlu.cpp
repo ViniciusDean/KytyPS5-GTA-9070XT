@@ -210,21 +210,57 @@ uint32_t EmitCompositeExtractU32x2(EmitterState& state, uint32_t arg0, IR::Value
 }
 
 uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	const auto pair = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0, arg1);
-	const auto packed = EmitPackHalf2x16(state, pair);
-	const auto back   = EmitExt(state, TypeF32Vector(state, 2), GLSLstd450UnpackHalf2x16, {packed});
-	auto       result = packed;
+	// V_CVT_PKRTZ_F16_F32 truncates toward zero, while the host's native half conversion rounds to
+	// nearest (a subnormal 1.5 * 2^-24 became 2 instead of 1, and 65520.0 became infinity). Build
+	// the halves from the float bits instead: it is exact for every finite input.
+	uint32_t result = 0;
 	for (uint32_t i = 0; i < 2; i++) {
-		const auto rounded = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), rounded, back, i);
-		const auto above =
-		    Binary(state, spv::OpFOrdGreaterThan, TypeBool(state),
-		           EmitExt(state, TypeF32(state), GLSLstd450FAbs, {rounded}),
-		           EmitExt(state, TypeF32(state), GLSLstd450FAbs, {i == 0 ? arg0 : arg1}));
-		result = Binary(state, spv::OpISub, TypeU32(state), result,
-		                Select(state, TypeU32(state), above,
-		                       ConstantU32(state, i == 0 ? 1u : 0x10000u), ConstantU32(state, 0)));
+		const auto bits = Unary(state, spv::OpBitcast, TypeU32(state), i == 0 ? arg0 : arg1);
+		const auto sign = EmitAndConstant(state, bits, 0x80000000u);
+		const auto mag  = EmitAndConstant(state, bits, 0x7fffffffu);
+		const auto mantissa = EmitAndConstant(state, mag, 0x7fffffu);
+		// Normal halves: drop the extra mantissa bits and rebias the exponent.
+		auto half = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		                   Binary(state, spv::OpISub, TypeU32(state), mag,
+		                          ConstantU32(state, 0x38000000u)),
+		                   ConstantU32(state, 13));
+		// Subnormal halves: shift the significand by the exponent deficit; below 2^-24 it is zero.
+		const auto exponent = Binary(state, spv::OpShiftRightLogical, TypeU32(state), mag,
+		                             ConstantU32(state, 23));
+		const auto shift    = Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 126),
+		                             exponent);
+		const auto subnormal = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		                              EmitOrU32(state, mantissa, ConstantU32(state, 0x800000u)),
+		                              shift);
+		half = Select(state, TypeU32(state),
+		              EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, mag, 0x38800000u),
+		              half,
+		              Select(state, TypeU32(state),
+		                     EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, mag,
+		                                            0x33800000u),
+		                     subnormal, ConstantU32(state, 0)));
+		// Finite values past the largest half stay at 0x7bff instead of rounding to infinity.
+		half = Select(state, TypeU32(state),
+		              EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, mag, 0x477fe000u),
+		              ConstantU32(state, 0x7bffu), half);
+		// Infinity keeps a zero mantissa; NaN keeps the top payload bits and is made quiet.
+		const auto nan_half = EmitOrU32(
+		    state, ConstantU32(state, 0x7e00u),
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), mantissa, ConstantU32(state, 13)));
+		half = Select(state, TypeU32(state),
+		              EmitCompareU32Constant(state, spv::OpUGreaterThan, mag, 0x7f800000u),
+		              nan_half,
+		              Select(state, TypeU32(state),
+		                     EmitCompareU32Constant(state, spv::OpIEqual, mag, 0x7f800000u),
+		                     ConstantU32(state, 0x7c00u), half));
+		half = EmitOrU32(state,
+		                 Binary(state, spv::OpShiftRightLogical, TypeU32(state), sign,
+		                        ConstantU32(state, 16)),
+		                 half);
+		result = i == 0 ? half
+		                : EmitOrU32(state, result,
+		                            Binary(state, spv::OpShiftLeftLogical, TypeU32(state), half,
+		                                   ConstantU32(state, 16)));
 	}
 	return result;
 }

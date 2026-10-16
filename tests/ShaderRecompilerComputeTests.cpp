@@ -25781,6 +25781,49 @@ TestCase CvtPkrtzF16F32SubnormalRoundsTowardZero() {
            O::S_ENDPGM}};
 }
 
+TestCase CvtPkrtzF16F32TruncatesEveryRange() {
+  using O = ShaderOpcode;
+
+  // Each pair (low, high) is packed by one V_CVT_PKRTZ_F16_F32.
+  const u32 inputs[][2] = {
+      {0x3f801800u, 0xbf801800u}, // 1 + 1.5 * 2^-11 would round up to 0x3c01.
+      {0x3f800000u, 0x3f7fffffu}, // 1.0, and the largest float below 1 (rounds up to 1).
+      {0x477ff000u, 0xc77ff000u}, // +-65520 round to infinity; they stay at +-65504.
+      {0x477fe000u, 0x501502f9u}, // 65504 and 1e10 clamp to the largest finite half.
+      {0x387fffffu, 0x38800000u}, // Just below the smallest normal half, and the half itself.
+      {0x337fffffu, 0xb37fffffu}, // Below 2^-24 truncates to a zero that keeps its sign.
+      {0x80000000u, 0x00000000u}, // Signed zeros.
+      {0x7f800000u, 0xff800000u}, // Infinities.
+      {0x7fc00000u, 0xffc00000u}, // Quiet NaNs.
+      {0x7f800001u, 0xff800001u}, // Signaling NaNs become quiet.
+  };
+  const u32 expected[] = {
+      0xbc003c00u, 0x3bff3c00u, 0xfbff7bffu, 0x7bff7bffu, 0x040003ffu,
+      0x80000000u, 0x00008000u, 0xfc007c00u, 0xfe007e00u, 0xfe007e00u,
+  };
+  constexpr u32 count = sizeof(expected) / sizeof(expected[0]);
+
+  std::vector<u32> code;
+  for (u32 i = 0; i < count; i++) {
+    AppendVMovLiteral(&code, 2 * i, inputs[i][0]);
+    AppendVMovLiteral(&code, 2 * i + 1, inputs[i][1]);
+  }
+  for (u32 i = 0; i < count; i++) {
+    code.push_back(EncodeVop2(0x2f, 20 + i, Vgpr(2 * i), 2 * i + 1));
+  }
+  for (u32 i = 0; i < count; i++) {
+    AppendStoreVgpr(&code, 20 + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"CvtPkrtzF16F32TruncatesEveryRange",
+          code,
+          {},
+          std::vector<u32>(expected, expected + count),
+          {O::V_MOV_B32, O::V_CVT_PKRTZ_F16_F32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
+}
+
 TestCase CvtPkrtzF16F32SdwaAndOutputModifiers() {
   using O = ShaderOpcode;
 
@@ -40287,6 +40330,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3pInt16Ops);
   AddCase(CvtPkU8F32PacksSelectedByte);
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
+  AddCase(CvtPkrtzF16F32TruncatesEveryRange);
   AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
   AddCase(VectorMinMaxF16Ops);
