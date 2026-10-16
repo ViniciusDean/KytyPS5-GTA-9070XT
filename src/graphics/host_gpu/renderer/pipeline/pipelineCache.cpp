@@ -1691,8 +1691,6 @@ void PipelineCache::Save() {
 		return;
 	}
 	WriteDriverCache();
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
 }
 
 void PipelineCache::WriteDriverCache() {
