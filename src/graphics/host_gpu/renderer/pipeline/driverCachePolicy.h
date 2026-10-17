@@ -12,6 +12,11 @@ inline bool ReplaceCacheFile(const std::filesystem::path& temp, const std::files
 	if (!std::filesystem::is_regular_file(temp, error)) {
 		return false;
 	}
+	// Never replace anything but a regular file (or an absent destination).
+	if (std::filesystem::exists(dst, error) && !std::filesystem::is_regular_file(dst, error)) {
+		std::filesystem::remove(temp, error);
+		return false;
+	}
 	std::filesystem::rename(temp, dst, error);
 	if (error) {
 		std::filesystem::remove(temp, error);

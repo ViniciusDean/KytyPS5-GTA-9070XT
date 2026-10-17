@@ -78,6 +78,10 @@ void TestReplaceSuccess() {
 	Check(ReplaceCacheFile(temp, dst) && ReadAll(dst) == payload && !std::filesystem::exists(temp), "create cache at an absent destination");
 	WriteAll(temp, "complete new cache");
 	Check(ReplaceCacheFile(temp, dst) && ReadAll(dst) == "complete new cache" && !std::filesystem::exists(temp), "replace an existing cache completely");
+	const auto directory_dst = directory.Path() / "directory.bin";
+	std::filesystem::create_directories(directory_dst);
+	WriteAll(temp, "snapshot");
+	Check(!ReplaceCacheFile(temp, directory_dst) && std::filesystem::is_directory(directory_dst), "a directory destination must not be replaced");
 	std::puts("DriverCachePolicyTests: absent and existing destinations receive complete cache");
 }
 }
