@@ -264,6 +264,7 @@ private:
 	std::atomic_uint64_t          m_unsaved_pipelines {0};
 	Common::Mutex                 m_write_mutex;
 	std::jthread                  m_save_thread;
+	uint64_t                      m_saved_payload_hash = 0; // payload of the file on disk (guarded by m_write_mutex)
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;

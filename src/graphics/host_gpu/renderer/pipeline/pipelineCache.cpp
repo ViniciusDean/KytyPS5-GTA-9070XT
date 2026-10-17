@@ -1637,6 +1637,8 @@ void PipelineCache::InitializeDriverCache() {
 				PipelineCacheLog(
 				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
 				    path);
+			} else {
+				m_saved_payload_hash = payload_hash;
 			}
 		} else {
 			file.Close();
@@ -1723,6 +1725,10 @@ void PipelineCache::WriteDriverCache() {
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	if (payload_hash == m_saved_payload_hash) {
+		// Pipelines that hit the driver cache do not change its data: skip rewriting an identical file.
+		return;
+	}
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
@@ -1747,6 +1753,7 @@ void PipelineCache::WriteDriverCache() {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
+	m_saved_payload_hash = payload_hash;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
