@@ -358,11 +358,13 @@ private:
 		uint64_t                                 size           = 0;
 		BufferId                                 buffer {};
 		bool                                     submitted      = false;
+		// A write fault: the page becomes CPU-dirty once published.
+		bool                                     is_write       = false;
 	};
 	// Execution thread: records the copy of the GPU-dirty bytes of [vaddr, vaddr + size) without
 	// waiting; PendingReadbackWindows::None when the synchronous path must run.
 	[[nodiscard]] uint32_t StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t size,
-	                                          SyncReason& reason);
+	                                          SyncReason& reason, bool is_write = false);
 	// Any thread: waits for the copy of an entry StartAsyncReadback() returned.
 	void WaitAsyncReadback(uint32_t index);
 	// Execution thread: publishes the copy; false when its window was invalidated.

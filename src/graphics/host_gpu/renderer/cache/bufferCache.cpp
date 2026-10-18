@@ -438,6 +438,15 @@ bool AsyncReadbackFlushEnabled() {
 	return enabled;
 }
 
+// KYTY_ASYNC_READBACK_WRITES=0: guest write faults on GPU-written memory read it back synchronously.
+bool AsyncWriteReadbackEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_READBACK_WRITES");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 uint64_t NowMicros() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -487,17 +496,22 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	auto&      gpu       = m_scheduler.Context().GetGpu();
 	const bool stats     = ReadbackStatsEnabled();
 	const bool run_ahead = gpu.UrgentCommandsRunAhead();
-	if (!is_write && AsyncReadbackEnabled() && run_ahead) {
+	if (AsyncReadbackEnabled() && run_ahead && (!is_write || AsyncWriteReadbackEnabled())) {
+		// A guest write fault reads the GPU's bytes of the page back the same way, then the page
+		// becomes CPU-dirty, as in the synchronous path.
 		// A guest read fault: the execution thread only records the copy and goes on with its
 		// work; this thread waits for the copy, then the execution thread publishes it (or, when
 		// something changed the window meanwhile, reads the memory back synchronously).
 		uint32_t index = PendingReadbackWindows::None;
-		gpu.SendUrgentCommandSync([this, vaddr, size, &index] {
+		gpu.SendUrgentCommandSync([this, vaddr, size, is_write, &index] {
+			if (is_write && !IsRegionRegistered(vaddr, size)) {
+				return;
+			}
 			auto reason = SyncReason::Count;
-			index       = StartAsyncReadback(FindBuffer(vaddr, size), vaddr, size, reason);
+			index = StartAsyncReadback(FindBuffer(vaddr, size), vaddr, size, reason, is_write);
 			if (index == PendingReadbackWindows::None) {
 				const auto start      = ReadbackStatsEnabled() ? NowMicros() : 0;
-				const bool downloaded = ReadMemorySync(vaddr, size, false);
+				const bool downloaded = ReadMemorySync(vaddr, size, is_write);
 				if (ReadbackStatsEnabled()) {
 					RecordSyncReadback(reason, start, downloaded);
 				}
@@ -512,10 +526,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			m_readback_stats.async_wait_us.fetch_add(NowMicros() - wait_start,
 			                                         std::memory_order_relaxed);
 		}
-		gpu.SendUrgentCommandSync([this, vaddr, size, index] {
+		gpu.SendUrgentCommandSync([this, vaddr, size, is_write, index] {
 			if (!FinishAsyncReadback(index)) {
 				const auto start      = ReadbackStatsEnabled() ? NowMicros() : 0;
-				const bool downloaded = ReadMemorySync(vaddr, size, false);
+				const bool downloaded = ReadMemorySync(vaddr, size, is_write);
 				if (ReadbackStatsEnabled()) {
 					RecordSyncReadback(SyncReason::Dropped, start, downloaded);
 				}
@@ -1357,7 +1371,7 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 }
 
 uint32_t BufferCache::StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t size,
-                                        SyncReason& reason) {
+                                        SyncReason& reason, bool is_write) {
 	if (!m_graphics.readback_queue || !id) {
 		reason = SyncReason::NoQueue;
 		return PendingReadbackWindows::None;
@@ -1506,6 +1520,7 @@ uint32_t BufferCache::StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t s
 	slot.needed         = needed;
 	slot.vaddr          = vaddr;
 	slot.size           = size;
+	slot.is_write       = is_write;
 	slot.buffer         = id;
 	slot.submitted      = true;
 	if (ReadbackStatsEnabled()) {
@@ -1560,6 +1575,9 @@ bool BufferCache::FinishAsyncReadback(uint32_t index) {
 		m_gpu_modified_ranges.Subtract(address, bytes);
 	}
 	m_memory_tracker.UnmarkRegionAsGpuModified(slot.vaddr, slot.size);
+	if (slot.is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(slot.vaddr, slot.size);
+	}
 	return true;
 }
 
