@@ -37,6 +37,9 @@ public:
 	// waits for it. Only for work that no queued operation depends on (memory the guest unmaps
 	// after the operations that used it executed).
 	void SendUrgentCommandSync(Common::UniqueFunction<void>&& command);
+	// True when SendUrgentCommandSync() from this thread runs the command on the execution thread
+	// ahead of its backlog (pipelined GPU, called from a guest thread).
+	[[nodiscard]] bool UrgentCommandsRunAhead() const noexcept;
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> draw_commands,

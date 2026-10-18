@@ -206,6 +206,10 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	done.acquire();
 }
 
+bool GuestGpu::UrgentCommandsRunAhead() const noexcept {
+	return m_pipelined && !IsGpuThread() && !g_cp_thread;
+}
+
 void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (!m_pipelined || IsGpuThread() || g_cp_thread) {
