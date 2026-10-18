@@ -181,6 +181,9 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	// KYTY_SHADER_STATS=1: prints program/permutation counts and the per-resolution cost every
+	// five seconds (see PrintShaderStats() in pipelineCache.cpp).
+	void PrintShaderStats();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;

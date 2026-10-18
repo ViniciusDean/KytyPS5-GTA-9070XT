@@ -33,6 +33,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
@@ -354,6 +355,64 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// KYTY_SHADER_STATS=1 prints the program/permutation counts and the cost of resolving a draw's
+// programs every five seconds.
+bool ShaderStatsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHADER_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// KYTY_SHADER_LOG=1 keeps the per-compile "Shaders:" counter (it scans every program, under the
+// program lock, on each new permutation).
+bool ShaderLogEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHADER_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+uint64_t NowNanoseconds() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+struct ShaderStats {
+	std::atomic_uint64_t lookups {0};
+	std::atomic_uint64_t last_hits {0};
+	std::atomic_uint64_t scan_steps {0};
+	std::atomic_uint64_t compiles {0};
+	std::atomic_uint64_t resolve_calls {0};
+	std::atomic_uint64_t resolve_ns {0};
+	std::atomic_uint64_t last_print_ms {0};
+};
+ShaderStats g_shader_stats;
+
+// Accumulates the wall time one program resolution (one stage of one draw) takes. The resolution
+// runs under the program lock, so this is the time the resolve thread and the compile workers
+// spend serialized on it.
+class ResolveStatsScope {
+public:
+	ResolveStatsScope(): m_active(ShaderStatsEnabled()), m_start(m_active ? NowNanoseconds() : 0) {}
+	~ResolveStatsScope() {
+		if (m_active) {
+			g_shader_stats.resolve_calls.fetch_add(1, std::memory_order_relaxed);
+			g_shader_stats.resolve_ns.fetch_add(NowNanoseconds() - m_start,
+			                                    std::memory_order_relaxed);
+		}
+	}
+	ResolveStatsScope(const ResolveStatsScope&)            = delete;
+	ResolveStatsScope& operator=(const ResolveStatsScope&) = delete;
+
+private:
+	bool     m_active;
+	uint64_t m_start;
+};
+
 } // namespace
 
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
@@ -577,9 +636,26 @@ struct PipelineCache::ProgramCache {
 		};
 		auto& last = entry.last_permutation[GuestGpu::IsGpuThread() ? 0u : 1u];
 		if (last < entry.permutations.size() && matches(entry.permutations[last])) {
+			if (ShaderStatsEnabled()) {
+				g_shader_stats.lookups.fetch_add(1, std::memory_order_relaxed);
+				g_shader_stats.last_hits.fetch_add(1, std::memory_order_relaxed);
+			}
 			return entry.permutations.begin() + static_cast<std::ptrdiff_t>(last);
 		}
-		const auto found = std::ranges::find_if(entry.permutations, matches);
+		uint64_t examined = 0;
+		auto     found    = entry.permutations.end();
+		for (auto candidate = entry.permutations.begin(); candidate != entry.permutations.end();
+		     ++candidate) {
+			++examined;
+			if (matches(*candidate)) {
+				found = candidate;
+				break;
+			}
+		}
+		if (ShaderStatsEnabled()) {
+			g_shader_stats.lookups.fetch_add(1, std::memory_order_relaxed);
+			g_shader_stats.scan_steps.fetch_add(examined, std::memory_order_relaxed);
+		}
 		if (found != entry.permutations.end()) {
 			last = static_cast<size_t>(found - entry.permutations.begin());
 		}
@@ -748,19 +824,23 @@ struct PipelineCache::ProgramCache {
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
-		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+		g_shader_stats.compiles.fetch_add(1, std::memory_order_relaxed);
+		if (ShaderLogEnabled()) {
+			std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1>
+			    counts {};
+			for (const auto& [key, source]: programs) {
+				counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+			}
+			// Guest geometry shaders are compiled through the host mesh stage.
+			std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
+			            counts[static_cast<size_t>(ShaderType::Vertex)],
+			            counts[static_cast<size_t>(ShaderType::Pixel)],
+			            counts[static_cast<size_t>(ShaderType::Compute)],
+			            counts[static_cast<size_t>(ShaderType::Mesh)],
+			            counts[static_cast<size_t>(ShaderType::Local)],
+			            counts[static_cast<size_t>(ShaderType::TessellationControl)],
+			            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		}
-		// Guest geometry shaders are compiled through the host mesh stage.
-		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
-		            counts[static_cast<size_t>(ShaderType::Vertex)],
-		            counts[static_cast<size_t>(ShaderType::Pixel)],
-		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)],
-		            counts[static_cast<size_t>(ShaderType::Local)],
-		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
-		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		return permutation.handle;
 	}
 
@@ -781,6 +861,16 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	GraphicContext&                                             graphics;
 	std::atomic_uint64_t                                        next_shader_id {0};
+
+	// Under the program lock (KYTY_SHADER_STATS reporting only).
+	[[nodiscard]] size_t ProgramCount() const { return programs.size(); }
+	[[nodiscard]] size_t PermutationCount() const {
+		size_t count = 0;
+		for (const auto& [key, entry]: programs) {
+			count += entry.permutations.size();
+		}
+		return count;
+	}
 
 	// Graphics programs compiled on worker threads: the resolve thread queues the programs and
 	// permutations its draws miss, so the shaders of a new area compile in parallel instead of
@@ -932,6 +1022,7 @@ struct PipelineCache::ProgramCache {
 				permutations.push_back(std::move(*permutation));
 				by_id[permutations.back().handle.id] = {&entry->first, &permutations.back()};
 				added                                = &permutations.back();
+				g_shader_stats.compiles.fetch_add(1, std::memory_order_relaxed);
 			}
 		}
 		if (const auto job_count = in_flight.find(job.key); --job_count->second == 0) {
@@ -1759,12 +1850,56 @@ void PipelineCache::WriteDriverCache() {
 	m_saved_payload_hash = payload_hash;
 }
 
+void PipelineCache::PrintShaderStats() {
+	if (!ShaderStatsEnabled()) {
+		return;
+	}
+	const auto now  = NowNanoseconds() / 1000000;
+	auto       last = g_shader_stats.last_print_ms.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_shader_stats.last_print_ms.store(now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 5000 ||
+	    !g_shader_stats.last_print_ms.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	const auto lookups       = g_shader_stats.lookups.exchange(0, std::memory_order_relaxed);
+	const auto last_hits     = g_shader_stats.last_hits.exchange(0, std::memory_order_relaxed);
+	const auto scan_steps    = g_shader_stats.scan_steps.exchange(0, std::memory_order_relaxed);
+	const auto compiles      = g_shader_stats.compiles.exchange(0, std::memory_order_relaxed);
+	const auto resolve_calls = g_shader_stats.resolve_calls.exchange(0, std::memory_order_relaxed);
+	const auto resolve_ns    = g_shader_stats.resolve_ns.exchange(0, std::memory_order_relaxed);
+	size_t     programs      = 0;
+	size_t     permutations  = 0;
+	{
+		const ProgramLockGuard lock(m_program_lock);
+		programs     = m_program_cache->ProgramCount();
+		permutations = m_program_cache->PermutationCount();
+	}
+	const auto scan_avg = lookups != 0 ? static_cast<double>(scan_steps) / static_cast<double>(lookups)
+	                                   : 0.0;
+	const auto res_avg =
+	    resolve_calls != 0
+	        ? static_cast<double>(resolve_ns) / static_cast<double>(resolve_calls) / 1000.0
+	        : 0.0;
+	std::printf("Shader stats (%llu ms): programs=%zu perms=%zu compiles=%llu | lookups=%llu "
+	            "last_hit=%llu scan=%llu (avg %.2f) | resolve=%llu (avg %.1f us)\n",
+	            static_cast<unsigned long long>(now - last), programs, permutations,
+	            static_cast<unsigned long long>(compiles), static_cast<unsigned long long>(lookups),
+	            static_cast<unsigned long long>(last_hits), static_cast<unsigned long long>(scan_steps),
+	            scan_avg, static_cast<unsigned long long>(resolve_calls), res_avg);
+	std::fflush(stdout);
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
     ProgramResolution* ahead) {
+	PrintShaderStats();
+	const ResolveStatsScope resolve_scope;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	// Ahead of execution, the vertex fetch tables are read through the resolution's log.
 	const ShaderGuestReaderScope reader(ahead != nullptr ? ReadAheadShaderState : nullptr,
@@ -1918,6 +2053,8 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info,
                                                ProgramResolution*           ahead) {
+	PrintShaderStats();
+	const ResolveStatsScope resolve_scope;
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
