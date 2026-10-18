@@ -427,6 +427,17 @@ uint32_t AsyncReadbackLimit() {
 	return limit;
 }
 
+// KYTY_ASYNC_READBACK_FLUSH=0: a guest read fault whose bytes were last written by the command
+// buffer being recorded takes the synchronous path (submit and wait) instead of submitting that
+// command buffer and copying asynchronously.
+bool AsyncReadbackFlushEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_READBACK_FLUSH");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 uint64_t NowMicros() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -1401,6 +1412,13 @@ uint32_t BufferCache::StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t s
 			}
 		}
 		needed = std::max(needed, m_write_ticks.Latest(begin, end));
+	}
+	if (needed >= m_scheduler.CurrentTick() && AsyncReadbackFlushEnabled() &&
+	    needed == m_scheduler.CurrentTick() && m_pending_writes.empty()) {
+		// The last writes are in the command buffer being recorded, between operations (no
+		// writes pending): submit it, as the synchronous path would before waiting for it, and
+		// let the copy wait for it on the GPU instead of the execution thread.
+		m_scheduler.Flush();
 	}
 	if (needed >= m_scheduler.CurrentTick()) {
 		reason = SyncReason::Unsubmitted;
