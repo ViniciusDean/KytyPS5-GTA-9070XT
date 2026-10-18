@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/pendingReadbacks.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -1316,6 +1317,44 @@ void CheckLeastRecentlyUsedCacheOrdering() {
           visited == std::vector<uint32_t>{1, 3, 2},
           "touching a non-tail item left a cycle or changed LRU order");
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
+}
+
+void CheckPendingReadbackWindows() {
+  constexpr const char *name = "PendingReadbackWindows";
+  PendingReadbackWindows windows;
+  const auto a = windows.Add(0x10000, 0x11000, 7);
+  const auto b = windows.Add(0x20000, 0x22000, 8);
+  Require(name, "add", a != PendingReadbackWindows::None && b != PendingReadbackWindows::None &&
+                           a != b && windows.ActiveCount() == 2,
+          "windows were not registered");
+  // A write that ends where a window begins, or begins where it ends, leaves it valid.
+  windows.Invalidate(0x0f000, 0x10000);
+  windows.Invalidate(0x11000, 0x12000);
+  windows.Invalidate(0x30000, 0x30000);
+  // One byte inside the second window invalidates it only.
+  windows.Invalidate(0x21fff, 0x22000);
+  Require(name, "invalidate", windows.Remove(a) && !windows.Remove(b) && windows.ActiveCount() == 0,
+          "a range invalidated the wrong windows");
+  Require(name, "remove twice", !windows.Remove(a), "a freed window was reported valid");
+  // Deleting the owner buffer invalidates its windows and reports their entries.
+  const auto c = windows.Add(0x40000, 0x41000, 3);
+  const auto d = windows.Add(0x50000, 0x51000, 4);
+  const auto mask = windows.InvalidateOwner(3);
+  Require(name, "owner", mask == (1u << c) && !windows.Remove(c) && windows.Remove(d),
+          "the owner's windows were not invalidated");
+  // A full table refuses new windows (the caller falls back to the synchronous readback).
+  uint32_t added = 0;
+  while (windows.Add(0x1000 * (added + 1), 0x1000 * (added + 2), 1) != PendingReadbackWindows::None) {
+    added++;
+  }
+  Require(name, "capacity", added == PendingReadbackWindows::Capacity,
+          "the table did not hold exactly its capacity");
+  for (uint32_t i = 0; i < PendingReadbackWindows::Capacity; i++) {
+    (void)windows.Remove(i);
+  }
+  Require(name, "empty", windows.ActiveCount() == 0, "windows leaked");
+  std::printf("[host]    %-32s ok
+", name);
 }
 
 void CheckScalarReadOverlap() {
@@ -49705,6 +49744,7 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   CheckScalarReadOverlap();
+  CheckPendingReadbackWindows();
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);
