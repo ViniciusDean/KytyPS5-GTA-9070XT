@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <fmt/format.h>
 #include <functional>
@@ -388,6 +389,9 @@ struct ShaderStats {
 	std::atomic_uint64_t compiles {0};
 	std::atomic_uint64_t resolve_calls {0};
 	std::atomic_uint64_t resolve_ns {0};
+	// The two halves of a resolution: the program lookup and the resource materialization.
+	std::atomic_uint64_t find_ns {0};
+	std::atomic_uint64_t mat_ns {0};
 	std::atomic_uint64_t last_print_ms {0};
 };
 ShaderStats g_shader_stats;
@@ -481,8 +485,15 @@ struct PipelineCache::ProgramCache {
 		// ProgramCache::FindPermutation()).
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
+			const bool     mat_stats    = ShaderStatsEnabled();
+			const uint64_t mat_start    = mat_stats ? NowNanoseconds() : 0;
+			const bool     materialized = ShaderRecompiler::IR::MaterializeResources(
+			    resource_plan, runtime, resources, specialization);
+			if (mat_stats) {
+				g_shader_stats.mat_ns.fetch_add(NowNanoseconds() - mat_start,
+				                                std::memory_order_relaxed);
+			}
+			EXIT_IF(!materialized);
 			const auto found =
 			    ProgramCache::FindPermutation(*this, specialization, push_data_cursor);
 			return found != permutations.end() ? &*found : nullptr;
@@ -682,7 +693,13 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		AppendNativeRayTracingKey(stage, params.hash, lookup_key.static_state);
-		const auto entry = programs.find(lookup_key);
+		const bool     find_stats = ShaderStatsEnabled();
+		const uint64_t find_start = find_stats ? NowNanoseconds() : 0;
+		const auto     entry      = programs.find(lookup_key);
+		if (find_stats) {
+			g_shader_stats.find_ns.fetch_add(NowNanoseconds() - find_start,
+			                                 std::memory_order_relaxed);
+		}
 		if (entry == programs.end() && ahead.stages != ProgramResolution::MaxStages) {
 			QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
 		}
@@ -708,8 +725,13 @@ struct PipelineCache::ProgramCache {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 			runtime.indirect_args_address = input_info.indirect_args_address;
 		}
-		if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
-		                                                resources, specialization)) {
+		const uint64_t mat_start = find_stats ? NowNanoseconds() : 0;
+		const bool     materialized = ShaderRecompiler::IR::MaterializeResources(
+		    entry->second.resource_plan, runtime, resources, specialization);
+		if (find_stats) {
+			g_shader_stats.mat_ns.fetch_add(NowNanoseconds() - mat_start, std::memory_order_relaxed);
+		}
+		if (!materialized) {
 			ahead.reads.Fail();
 			return {};
 		}
@@ -750,7 +772,13 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		AppendNativeRayTracingKey(stage, params.hash, lookup_key.static_state);
-		auto                                         entry = programs.find(lookup_key);
+		const bool     find_stats = ShaderStatsEnabled();
+		const uint64_t find_start = find_stats ? NowNanoseconds() : 0;
+		auto           entry      = programs.find(lookup_key);
+		if (find_stats) {
+			g_shader_stats.find_ns.fetch_add(NowNanoseconds() - find_start,
+			                                 std::memory_order_relaxed);
+		}
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -1870,6 +1898,8 @@ void PipelineCache::PrintShaderStats() {
 	const auto compiles      = g_shader_stats.compiles.exchange(0, std::memory_order_relaxed);
 	const auto resolve_calls = g_shader_stats.resolve_calls.exchange(0, std::memory_order_relaxed);
 	const auto resolve_ns    = g_shader_stats.resolve_ns.exchange(0, std::memory_order_relaxed);
+	const auto find_ns       = g_shader_stats.find_ns.exchange(0, std::memory_order_relaxed);
+	const auto mat_ns        = g_shader_stats.mat_ns.exchange(0, std::memory_order_relaxed);
 	size_t     programs      = 0;
 	size_t     permutations  = 0;
 	{
@@ -1883,12 +1913,23 @@ void PipelineCache::PrintShaderStats() {
 	    resolve_calls != 0
 	        ? static_cast<double>(resolve_ns) / static_cast<double>(resolve_calls) / 1000.0
 	        : 0.0;
-	std::printf("Shader stats (%llu ms): programs=%zu perms=%zu compiles=%llu | lookups=%llu "
-	            "last_hit=%llu scan=%llu (avg %.2f) | resolve=%llu (avg %.1f us)\n",
-	            static_cast<unsigned long long>(now - last), programs, permutations,
-	            static_cast<unsigned long long>(compiles), static_cast<unsigned long long>(lookups),
-	            static_cast<unsigned long long>(last_hits), static_cast<unsigned long long>(scan_steps),
-	            scan_avg, static_cast<unsigned long long>(resolve_calls), res_avg);
+	const auto find_avg =
+	    resolve_calls != 0 ? static_cast<double>(find_ns) / static_cast<double>(resolve_calls) / 1000.0
+	                       : 0.0;
+	const auto mat_avg =
+	    resolve_calls != 0 ? static_cast<double>(mat_ns) / static_cast<double>(resolve_calls) / 1000.0
+	                       : 0.0;
+	const auto  stamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+	std::tm     tm {};
+	localtime_s(&tm, &stamp);
+	std::printf("[%02d:%02d:%02d] Shader stats (%llu ms): programs=%zu perms=%zu compiles=%llu | "
+	            "lookups=%llu last_hit=%llu scan=%llu (avg %.2f) | resolve=%llu (avg %.1f us) "
+	            "find=%.1f us mat=%.1f us\n",
+	            tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<unsigned long long>(now - last),
+	            programs, permutations, static_cast<unsigned long long>(compiles),
+	            static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(last_hits),
+	            static_cast<unsigned long long>(scan_steps), scan_avg,
+	            static_cast<unsigned long long>(resolve_calls), res_avg, find_avg, mat_avg);
 	std::fflush(stdout);
 }
 
