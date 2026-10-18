@@ -1353,8 +1353,7 @@ void CheckPendingReadbackWindows() {
     (void)windows.Remove(i);
   }
   Require(name, "empty", windows.ActiveCount() == 0, "windows leaked");
-  std::printf("[host]    %-32s ok
-", name);
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 void CheckScalarReadOverlap() {
