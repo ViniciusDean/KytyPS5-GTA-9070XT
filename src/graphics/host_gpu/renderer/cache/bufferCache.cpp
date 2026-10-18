@@ -414,6 +414,19 @@ bool ReadbackStatsEnabled() {
 	return enabled;
 }
 
+// KYTY_ASYNC_READBACK_MAX: asynchronous fault readbacks in flight at once (1-32, default 16).
+uint32_t AsyncReadbackLimit() {
+	static const uint32_t limit = [] {
+		const char* value = std::getenv("KYTY_ASYNC_READBACK_MAX");
+		if (value == nullptr || value[0] == 0) {
+			return 16u;
+		}
+		const auto parsed = std::strtoul(value, nullptr, 10);
+		return static_cast<uint32_t>(std::clamp<unsigned long>(parsed, 1, PendingReadbackWindows::Capacity));
+	}();
+	return limit;
+}
+
 uint64_t NowMicros() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -1342,7 +1355,7 @@ uint32_t BufferCache::StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t s
 		reason = SyncReason::DeviceAddressPending;
 		return PendingReadbackWindows::None;
 	}
-	if (m_pending_readbacks.ActiveCount() >= PendingReadbackWindows::Capacity) {
+	if (m_pending_readbacks.ActiveCount() >= AsyncReadbackLimit()) {
 		reason = SyncReason::Full;
 		return PendingReadbackWindows::None;
 	}

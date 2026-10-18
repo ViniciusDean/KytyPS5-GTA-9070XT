@@ -20,7 +20,8 @@ namespace Libs::Graphics {
 // Thread-safe: backing writes are reported from any thread.
 class PendingReadbackWindows {
 public:
-	static constexpr uint32_t Capacity = 8;
+	// Entries are reported as a 32-bit mask (InvalidateOwner()).
+	static constexpr uint32_t Capacity = 32;
 	static constexpr uint32_t None     = UINT32_MAX;
 
 	// Registers [begin, end) for `owner`; None when every entry is in use.
