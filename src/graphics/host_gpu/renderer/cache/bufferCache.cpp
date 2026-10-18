@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <string>
+#include <array>
 #include <cstdio>
 #include <bit>
 #include <cstdlib>
@@ -24,6 +26,8 @@
 #include <memory>
 #include <utility>
 #include <vector>
+
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -416,20 +420,38 @@ uint64_t NowMicros() {
 	                                 .count());
 }
 
+constexpr std::array<const char*, static_cast<size_t>(BufferCache::SyncReason::Count)>
+    SyncReasonNames = {"gpu-read",  "gpu-write",   "cp-read",  "cp-write",     "guest-write",
+                       "disabled",  "no-queue",    "bda-pend", "full",         "empty",
+                       "out-of-buf", "pend-writes", "unsubmitted", "dropped"};
+
 } // namespace
 
-void BufferCache::ReadMemorySync(uint64_t vaddr, uint64_t size, bool is_write) {
+void BufferCache::RecordSyncReadback(SyncReason reason, uint64_t start, bool downloaded) {
+	const auto index = static_cast<size_t>(reason);
+	m_readback_stats.sync.fetch_add(1, std::memory_order_relaxed);
+	m_readback_stats.sync_us.fetch_add(NowMicros() - start, std::memory_order_relaxed);
+	m_readback_stats.reason_count[index].fetch_add(1, std::memory_order_relaxed);
+	m_readback_stats.reason_us[index].fetch_add(NowMicros() - start, std::memory_order_relaxed);
+	if (downloaded) {
+		m_readback_stats.reason_hits[index].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+bool BufferCache::ReadMemorySync(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
-		return;
+		return false;
 	}
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-	if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+	const bool downloaded = DownloadBufferMemory<false>(buffer, vaddr, size);
+	if (downloaded) {
 		m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	}
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	}
+	return downloaded;
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -438,21 +460,22 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	auto& gpu   = m_scheduler.Context().GetGpu();
-	const bool stats = ReadbackStatsEnabled();
-	if (!is_write && AsyncReadbackEnabled() && gpu.UrgentCommandsRunAhead()) {
+	auto&      gpu       = m_scheduler.Context().GetGpu();
+	const bool stats     = ReadbackStatsEnabled();
+	const bool run_ahead = gpu.UrgentCommandsRunAhead();
+	if (!is_write && AsyncReadbackEnabled() && run_ahead) {
 		// A guest read fault: the execution thread only records the copy and goes on with its
 		// work; this thread waits for the copy, then the execution thread publishes it (or, when
 		// something changed the window meanwhile, reads the memory back synchronously).
 		uint32_t index = PendingReadbackWindows::None;
 		gpu.SendUrgentCommandSync([this, vaddr, size, &index] {
-			index = StartAsyncReadback(FindBuffer(vaddr, size), vaddr, size);
+			auto reason = SyncReason::Count;
+			index       = StartAsyncReadback(FindBuffer(vaddr, size), vaddr, size, reason);
 			if (index == PendingReadbackWindows::None) {
-				const auto start = ReadbackStatsEnabled() ? NowMicros() : 0;
-				ReadMemorySync(vaddr, size, false);
+				const auto start      = ReadbackStatsEnabled() ? NowMicros() : 0;
+				const bool downloaded = ReadMemorySync(vaddr, size, false);
 				if (ReadbackStatsEnabled()) {
-					m_readback_stats.sync.fetch_add(1, std::memory_order_relaxed);
-					m_readback_stats.sync_us.fetch_add(NowMicros() - start, std::memory_order_relaxed);
+					RecordSyncReadback(reason, start, downloaded);
 				}
 			}
 		});
@@ -467,22 +490,33 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		gpu.SendUrgentCommandSync([this, vaddr, size, index] {
 			if (!FinishAsyncReadback(index)) {
-				ReadMemorySync(vaddr, size, false);
+				const auto start      = ReadbackStatsEnabled() ? NowMicros() : 0;
+				const bool downloaded = ReadMemorySync(vaddr, size, false);
+				if (ReadbackStatsEnabled()) {
+					RecordSyncReadback(SyncReason::Dropped, start, downloaded);
+				}
 			}
 			PrintReadbackStats();
 		});
 		return;
 	}
+	auto reason = SyncReason::Disabled;
+	if (GuestGpu::IsGpuThread()) {
+		reason = is_write ? SyncReason::GpuThreadWrite : SyncReason::GpuThreadRead;
+	} else if (!run_ahead) {
+		reason = is_write ? SyncReason::CpThreadWrite : SyncReason::CpThreadRead;
+	} else if (is_write) {
+		reason = SyncReason::GuestWrite;
+	}
 	// The guest reads (or writes) memory the GPU wrote only after a label the execution thread
 	// writes once the work before it executed: the operations queued since cannot be what the
 	// access needs, so the readback runs before them instead of after the whole backlog (a
 	// frame of draws, 100-200 ms while an area streams in).
-	gpu.SendUrgentCommandSync([this, vaddr, size, is_write] {
-		const auto start = ReadbackStatsEnabled() ? NowMicros() : 0;
-		ReadMemorySync(vaddr, size, is_write);
+	gpu.SendUrgentCommandSync([this, vaddr, size, is_write, reason] {
+		const auto start      = ReadbackStatsEnabled() ? NowMicros() : 0;
+		const bool downloaded = ReadMemorySync(vaddr, size, is_write);
 		if (ReadbackStatsEnabled()) {
-			m_readback_stats.sync.fetch_add(1, std::memory_order_relaxed);
-			m_readback_stats.sync_us.fetch_add(NowMicros() - start, std::memory_order_relaxed);
+			RecordSyncReadback(reason, start, downloaded);
 			PrintReadbackStats();
 		}
 	});
@@ -1298,9 +1332,18 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 	return true;
 }
 
-uint32_t BufferCache::StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t size) {
-	if (!m_graphics.readback_queue || m_device_address_pending || !id ||
-	    m_pending_readbacks.ActiveCount() >= PendingReadbackWindows::Capacity) {
+uint32_t BufferCache::StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t size,
+                                        SyncReason& reason) {
+	if (!m_graphics.readback_queue || !id) {
+		reason = SyncReason::NoQueue;
+		return PendingReadbackWindows::None;
+	}
+	if (m_device_address_pending) {
+		reason = SyncReason::DeviceAddressPending;
+		return PendingReadbackWindows::None;
+	}
+	if (m_pending_readbacks.ActiveCount() >= PendingReadbackWindows::Capacity) {
+		reason = SyncReason::Full;
 		return PendingReadbackWindows::None;
 	}
 	auto&      buffer         = m_slot_buffers[id];
@@ -1321,10 +1364,12 @@ uint32_t BufferCache::StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t s
 		    covered.emplace_back(address, bytes);
 	    });
 	if (copies.empty()) {
+		reason = SyncReason::Empty;
 		return PendingReadbackWindows::None;
 	}
 	for (const auto& copy: copies) {
 		if (!buffer.IsInBounds(buffer_address + copy.srcOffset, copy.size)) {
+			reason = SyncReason::OutOfBuffer;
 			return PendingReadbackWindows::None;
 		}
 	}
@@ -1338,12 +1383,14 @@ uint32_t BufferCache::StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t s
 		const auto end   = begin + copy.size;
 		for (const auto& [write, write_size]: m_pending_writes) {
 			if (write < end && begin < write + write_size) {
+				reason = SyncReason::PendingWrites;
 				return PendingReadbackWindows::None;
 			}
 		}
 		needed = std::max(needed, m_write_ticks.Latest(begin, end));
 	}
 	if (needed >= m_scheduler.CurrentTick()) {
+		reason = SyncReason::Unsubmitted;
 		return PendingReadbackWindows::None;
 	}
 	// The window: whole tracker pages of the fault and of the copies (an unmark releases pages).
@@ -1355,6 +1402,7 @@ uint32_t BufferCache::StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t s
 	}
 	const auto index = m_pending_readbacks.Add(window_begin, window_end, id.index);
 	if (index == PendingReadbackWindows::None) {
+		reason = SyncReason::Full;
 		return PendingReadbackWindows::None;
 	}
 	const bool device_address = needed != 0 && needed == m_device_address_tick;
@@ -1517,10 +1565,19 @@ void BufferCache::PrintReadbackStats() {
 	const auto published = m_readback_stats.async_published.exchange(0, std::memory_order_relaxed);
 	const auto dropped   = m_readback_stats.async_dropped.exchange(0, std::memory_order_relaxed);
 	const auto wait_us   = m_readback_stats.async_wait_us.exchange(0, std::memory_order_relaxed);
-	std::printf("Readback stats (%" PRIu64 " ms): sync=%" PRIu64 " (exec thread %" PRIu64
-	            " us) async=%" PRIu64 " published=%" PRIu64 " dropped=%" PRIu64
-	            " (guest wait %" PRIu64 " us)\n",
-	            now - last, sync, sync_us, started, published, dropped, wait_us);
+	std::string line = fmt::format("Readback stats ({} ms): sync={} (exec thread {} us) async={} "
+	                                "published={} dropped={} (guest wait {} us) |",
+	                                now - last, sync, sync_us, started, published, dropped, wait_us);
+	for (size_t i = 0; i < SyncReasonNames.size(); i++) {
+		const auto count = m_readback_stats.reason_count[i].exchange(0, std::memory_order_relaxed);
+		const auto us    = m_readback_stats.reason_us[i].exchange(0, std::memory_order_relaxed);
+		const auto hits  = m_readback_stats.reason_hits[i].exchange(0, std::memory_order_relaxed);
+		if (count != 0) {
+			// count/total exec-thread ms/readbacks that copied bytes
+			line += fmt::format(" {}={}/{}ms/{}", SyncReasonNames[i], count, us / 1000, hits);
+		}
+	}
+	std::printf("%s\n", line.c_str());
 	std::fflush(stdout);
 }
 

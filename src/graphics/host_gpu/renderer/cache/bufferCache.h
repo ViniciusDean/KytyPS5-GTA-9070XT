@@ -31,6 +31,25 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 
 class BufferCache {
 public:
+	// Why a fault readback ran synchronously on the execution thread (KYTY_READBACK_STATS).
+	enum class SyncReason : uint8_t {
+		GpuThreadRead,        // a GPU thread's own readback (indirect arguments, images...)
+		GpuThreadWrite,       // a GPU thread wrote protected memory
+		CpThreadRead,         // command processor fault, or the GPU is not pipelined
+		CpThreadWrite,
+		GuestWrite,           // a guest write fault
+		Disabled,             // KYTY_ASYNC_READBACK=0
+		NoQueue,              // no readback queue
+		DeviceAddressPending, // device-address writes still being recorded
+		Full,                 // every asynchronous readback entry in use
+		Empty,                // nothing GPU-dirty to copy
+		OutOfBuffer,          // GPU-dirty bytes outside the faulting buffer
+		PendingWrites,        // writes of the operation being recorded
+		Unsubmitted,          // the last writes are in the command buffer being recorded
+		Dropped,              // the asynchronous copy was invalidated
+		Count
+	};
+
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
@@ -342,14 +361,17 @@ private:
 	};
 	// Execution thread: records the copy of the GPU-dirty bytes of [vaddr, vaddr + size) without
 	// waiting; PendingReadbackWindows::None when the synchronous path must run.
-	[[nodiscard]] uint32_t StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint32_t StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t size,
+	                                          SyncReason& reason);
 	// Any thread: waits for the copy of an entry StartAsyncReadback() returned.
 	void WaitAsyncReadback(uint32_t index);
 	// Execution thread: publishes the copy; false when its window was invalidated.
 	[[nodiscard]] bool FinishAsyncReadback(uint32_t index);
 	// Execution thread: before a buffer goes away, waits for the copies that read it.
 	void RetireAsyncReadbacks(BufferId id);
-	void ReadMemorySync(uint64_t vaddr, uint64_t size, bool is_write);
+	// True when bytes were copied back.
+	bool ReadMemorySync(uint64_t vaddr, uint64_t size, bool is_write);
+	void RecordSyncReadback(SyncReason reason, uint64_t start, bool downloaded);
 	void PrintReadbackStats();
 	std::array<AsyncReadback, PendingReadbackWindows::Capacity> m_async_readbacks;
 	PendingReadbackWindows                                     m_pending_readbacks;
@@ -361,6 +383,9 @@ private:
 		std::atomic_uint64_t async_wait_us {0};
 		std::atomic_uint64_t sync_us {0};
 		std::atomic_uint64_t last_print_ms {0};
+		std::array<std::atomic_uint64_t, static_cast<size_t>(SyncReason::Count)> reason_count {};
+		std::array<std::atomic_uint64_t, static_cast<size_t>(SyncReason::Count)> reason_us {};
+		std::array<std::atomic_uint64_t, static_cast<size_t>(SyncReason::Count)> reason_hits {};
 	};
 	ReadbackStats m_readback_stats;
 	// The mirror: each line holds a copy of its bytes in a cached buffer, recorded at the end of
