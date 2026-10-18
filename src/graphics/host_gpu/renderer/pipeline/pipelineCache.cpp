@@ -376,6 +376,26 @@ bool ShaderLogEnabled() {
 	return enabled;
 }
 
+// KYTY_SHADER_JOB_PRIORITY=0: programs the draws of this session miss queue behind the programs of
+// earlier sessions (the shader store) instead of ahead of them.
+bool ShaderJobPriorityEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHADER_JOB_PRIORITY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// KYTY_SHADER_STEAL=0: the execution thread waits for a queued compile of the program it needs
+// instead of taking the job and compiling it itself.
+bool ShaderStealEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHADER_STEAL");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 uint64_t NowNanoseconds() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -392,6 +412,13 @@ struct ShaderStats {
 	// The two halves of a resolution: the program lookup and the resource materialization.
 	std::atomic_uint64_t find_ns {0};
 	std::atomic_uint64_t mat_ns {0};
+	// The execution thread's own compiles, its waits for workers and the jobs it took from them.
+	std::atomic_uint64_t inline_count {0};
+	std::atomic_uint64_t inline_ns {0};
+	std::atomic_uint64_t wait_count {0};
+	std::atomic_uint64_t wait_ns {0};
+	std::atomic_uint64_t steal_count {0};
+	std::atomic_uint64_t steal_ns {0};
 	std::atomic_uint64_t last_print_ms {0};
 };
 ShaderStats g_shader_stats;
@@ -810,6 +837,7 @@ struct PipelineCache::ProgramCache {
 		if (WaitForCompile()) {
 			return Get(params, input_info, push_data_cursor);
 		}
+		const auto inline_start = ShaderStatsEnabled() ? NowNanoseconds() : 0;
 		const auto [options, stage_name] = MakeCompileOptions(stage, params, input_info);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		const auto push_data_start = push_data_cursor;
@@ -853,6 +881,11 @@ struct PipelineCache::ProgramCache {
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		g_shader_stats.compiles.fetch_add(1, std::memory_order_relaxed);
+		if (ShaderStatsEnabled()) {
+			g_shader_stats.inline_count.fetch_add(1, std::memory_order_relaxed);
+			g_shader_stats.inline_ns.fetch_add(NowNanoseconds() - inline_start,
+			                                   std::memory_order_relaxed);
+		}
 		if (ShaderLogEnabled()) {
 			std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1>
 			    counts {};
@@ -964,7 +997,12 @@ struct PipelineCache::ProgramCache {
 		in_flight[lookup_key]++;
 		{
 			std::lock_guard lock(job_mutex);
-			jobs.push_back(std::move(job));
+			if (ShaderJobPriorityEnabled()) {
+				// A draw of this session waits for it; the store's programs may never be drawn.
+				jobs.push_front(std::move(job));
+			} else {
+				jobs.push_back(std::move(job));
+			}
 		}
 		job_available.notify_one();
 	}
@@ -975,12 +1013,53 @@ struct PipelineCache::ProgramCache {
 		if (!in_flight.contains(lookup_key)) {
 			return false;
 		}
-		const auto key = lookup_key;
-		do {
+		const auto key        = lookup_key;
+		const bool stats      = ShaderStatsEnabled();
+		const auto wait_start = stats ? NowNanoseconds() : 0;
+		if (ShaderStealEnabled()) {
+			// A queued job of this program may sit behind hundreds of others (the shader store
+			// at start-up, a whole area's programs in a transition): compile it here instead of
+			// waiting for a worker to reach it. Jobs a worker already runs are waited for below.
+			for (;;) {
+				std::unique_ptr<CompileJob> job;
+				{
+					std::lock_guard lock(job_mutex);
+					const auto found = std::ranges::find_if(
+					    jobs, [&](const std::unique_ptr<CompileJob>& queued) { return queued->key == key; });
+					if (found != jobs.end()) {
+						job = std::move(*found);
+						jobs.erase(found);
+					}
+				}
+				if (job == nullptr) {
+					break;
+				}
+				const auto steal_start = stats ? NowNanoseconds() : 0;
+				UnlockPrograms();
+				if (job->vertex != nullptr) {
+					RunCompileJob(*job, *job->vertex);
+				} else if (job->pixel != nullptr) {
+					RunCompileJob(*job, *job->pixel);
+				} else {
+					RunCompileJob(*job, *job->compute);
+				}
+				LockPrograms();
+				if (stats) {
+					g_shader_stats.steal_count.fetch_add(1, std::memory_order_relaxed);
+					g_shader_stats.steal_ns.fetch_add(NowNanoseconds() - steal_start,
+					                                  std::memory_order_relaxed);
+				}
+			}
+		}
+		while (in_flight.contains(key)) {
 			UnlockPrograms();
 			std::this_thread::yield();
 			LockPrograms();
-		} while (in_flight.contains(key));
+		}
+		if (stats) {
+			g_shader_stats.wait_count.fetch_add(1, std::memory_order_relaxed);
+			g_shader_stats.wait_ns.fetch_add(NowNanoseconds() - wait_start, std::memory_order_relaxed);
+		}
 		return true;
 	}
 
@@ -1900,6 +1979,17 @@ void PipelineCache::PrintShaderStats() {
 	const auto resolve_ns    = g_shader_stats.resolve_ns.exchange(0, std::memory_order_relaxed);
 	const auto find_ns       = g_shader_stats.find_ns.exchange(0, std::memory_order_relaxed);
 	const auto mat_ns        = g_shader_stats.mat_ns.exchange(0, std::memory_order_relaxed);
+	const auto inline_count  = g_shader_stats.inline_count.exchange(0, std::memory_order_relaxed);
+	const auto inline_ns     = g_shader_stats.inline_ns.exchange(0, std::memory_order_relaxed);
+	const auto wait_count    = g_shader_stats.wait_count.exchange(0, std::memory_order_relaxed);
+	const auto wait_ns       = g_shader_stats.wait_ns.exchange(0, std::memory_order_relaxed);
+	const auto steal_count   = g_shader_stats.steal_count.exchange(0, std::memory_order_relaxed);
+	const auto steal_ns      = g_shader_stats.steal_ns.exchange(0, std::memory_order_relaxed);
+	size_t     queued_jobs   = 0;
+	{
+		std::lock_guard lock(m_program_cache->job_mutex);
+		queued_jobs = m_program_cache->jobs.size();
+	}
 	size_t     programs      = 0;
 	size_t     permutations  = 0;
 	{
@@ -1930,6 +2020,16 @@ void PipelineCache::PrintShaderStats() {
 	            static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(last_hits),
 	            static_cast<unsigned long long>(scan_steps), scan_avg,
 	            static_cast<unsigned long long>(resolve_calls), res_avg, find_avg, mat_avg);
+	// Execution thread: inline compiles, waits for workers (including stolen jobs), stolen jobs;
+	// jobs still queued for the workers.
+	std::printf("[%02d:%02d:%02d] Shader exec: inline=%llu/%llu ms wait=%llu/%llu ms "
+	            "stolen=%llu/%llu ms queued=%zu\n",
+	            tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<unsigned long long>(inline_count),
+	            static_cast<unsigned long long>(inline_ns / 1000000),
+	            static_cast<unsigned long long>(wait_count),
+	            static_cast<unsigned long long>(wait_ns / 1000000),
+	            static_cast<unsigned long long>(steal_count),
+	            static_cast<unsigned long long>(steal_ns / 1000000), queued_jobs);
 	std::fflush(stdout);
 }
 
