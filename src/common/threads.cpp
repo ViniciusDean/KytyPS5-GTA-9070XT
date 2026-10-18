@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
 #include <mutex>
@@ -226,6 +227,43 @@ void Thread::PinCurrent(int logical_cpu) {
 	}
 #else
 	(void)logical_cpu;
+#endif
+}
+
+void Thread::DisableProcessPowerThrottling() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (const char* value = std::getenv("KYTY_POWER_THROTTLING"); value != nullptr && value[0] == '1') {
+		return;
+	}
+	// PROCESS_POWER_THROTTLING_STATE / ProcessPowerThrottling (Windows 10 1709+), declared locally
+	// and resolved at run time so older SDK targets still build and older systems still start.
+	struct PowerThrottlingState {
+		ULONG version;
+		ULONG control_mask;
+		ULONG state_mask;
+	};
+	constexpr ULONG Version                 = 1;
+	constexpr ULONG ExecutionSpeed          = 0x1;
+	constexpr ULONG IgnoreTimerResolution   = 0x4;
+	constexpr int   ProcessPowerThrottlingClass = 4;
+	using SetProcessInformationFn = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+	auto* kernel = ::GetModuleHandleW(L"kernel32.dll");
+	if (kernel == nullptr) {
+		return;
+	}
+	auto set_info = reinterpret_cast<SetProcessInformationFn>(
+	    reinterpret_cast<void*>(::GetProcAddress(kernel, "SetProcessInformation")));
+	if (set_info == nullptr) {
+		return;
+	}
+	// Control the execution speed and timer resolution policies and turn both throttles off:
+	// high QoS (P-cores, full clock) and timer resolution requests honoured while unfocused.
+	PowerThrottlingState state {Version, ExecutionSpeed | IgnoreTimerResolution, 0};
+	if (set_info(::GetCurrentProcess(), ProcessPowerThrottlingClass, &state, sizeof(state)) == 0) {
+		// Older systems reject the timer resolution flag: retry with execution speed only.
+		state.control_mask = ExecutionSpeed;
+		set_info(::GetCurrentProcess(), ProcessPowerThrottlingClass, &state, sizeof(state));
+	}
 #endif
 }
 

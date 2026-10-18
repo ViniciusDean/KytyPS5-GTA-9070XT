@@ -38,6 +38,10 @@ public:
 	// processor (when `logical_cpu` is not negative). No-ops where unsupported.
 	static void RaiseCurrentPriority();
 	static void PinCurrent(int logical_cpu);
+	// Windows 11 on hybrid CPUs (Intel P/E cores): asks the scheduler not to treat the process
+	// as a background, power-throttled one (EcoQoS), which moves its threads to E-cores and lowers
+	// their clock. KYTY_POWER_THROTTLING=1 keeps the default behaviour. No-op elsewhere.
+	static void DisableProcessPowerThrottling();
 
 	// Get current thread id
 	// Once a thread has finished, the id may be reused by another thread.
