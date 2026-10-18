@@ -1027,6 +1027,10 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr) {
+		// Asynchronous fault readbacks of these bytes in flight are now stale.
+		GetGpuResources().GetBufferCache().NoteBackingWrite(vaddr, size);
+	}
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }

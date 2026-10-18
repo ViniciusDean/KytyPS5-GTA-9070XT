@@ -9,8 +9,11 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/pendingReadbacks.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
+#include <atomic>
 #include <map>
 #include <span>
 #include <unordered_map>
@@ -64,6 +67,11 @@ public:
 	// A guest write faulted on a page the cache protects.
 	void                   InvalidateFaultedPage(uint64_t vaddr);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// Any thread: guest backing bytes in [vaddr, vaddr + size) were written; asynchronous fault
+	// readbacks of those bytes in flight are dropped (see PendingReadbackWindows).
+	void NoteBackingWrite(uint64_t vaddr, uint64_t size) {
+		m_pending_readbacks.Invalidate(vaddr, size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size);
+	}
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// Caches memory a shader reached through a device address the host did not know beforehand.
@@ -313,6 +321,48 @@ private:
 		std::unique_ptr<Buffer> staging;
 	};
 	ReadbackQueue m_readback;
+	// Asynchronous guest fault readbacks (KYTY_ASYNC_READBACK, on by default): the execution
+	// thread records the copy and returns; the faulting thread waits for it; the execution thread
+	// publishes it unless its window was invalidated meanwhile (see ReadMemory()).
+	struct AsyncReadback {
+		vk::CommandPool                          pool    = nullptr;
+		vk::CommandBuffer                        command = nullptr;
+		vk::Fence                                fence   = nullptr;
+		std::unique_ptr<Buffer>                  staging;
+		std::vector<vk::BufferCopy>              copies;
+		// The GPU-dirty ranges the copies cover, removed on publication.
+		std::vector<std::pair<uint64_t, uint64_t>> covered;
+		uint64_t                                 buffer_address = 0;
+		uint64_t                                 total_size     = 0;
+		uint64_t                                 needed         = 0;
+		uint64_t                                 vaddr          = 0;
+		uint64_t                                 size           = 0;
+		BufferId                                 buffer {};
+		bool                                     submitted      = false;
+	};
+	// Execution thread: records the copy of the GPU-dirty bytes of [vaddr, vaddr + size) without
+	// waiting; PendingReadbackWindows::None when the synchronous path must run.
+	[[nodiscard]] uint32_t StartAsyncReadback(BufferId id, uint64_t vaddr, uint64_t size);
+	// Any thread: waits for the copy of an entry StartAsyncReadback() returned.
+	void WaitAsyncReadback(uint32_t index);
+	// Execution thread: publishes the copy; false when its window was invalidated.
+	[[nodiscard]] bool FinishAsyncReadback(uint32_t index);
+	// Execution thread: before a buffer goes away, waits for the copies that read it.
+	void RetireAsyncReadbacks(BufferId id);
+	void ReadMemorySync(uint64_t vaddr, uint64_t size, bool is_write);
+	void PrintReadbackStats();
+	std::array<AsyncReadback, PendingReadbackWindows::Capacity> m_async_readbacks;
+	PendingReadbackWindows                                     m_pending_readbacks;
+	struct ReadbackStats {
+		std::atomic_uint64_t sync {0};
+		std::atomic_uint64_t async_started {0};
+		std::atomic_uint64_t async_published {0};
+		std::atomic_uint64_t async_dropped {0};
+		std::atomic_uint64_t async_wait_us {0};
+		std::atomic_uint64_t sync_us {0};
+		std::atomic_uint64_t last_print_ms {0};
+	};
+	ReadbackStats m_readback_stats;
 	// The mirror: each line holds a copy of its bytes in a cached buffer, recorded at the end of
 	// the command buffer `tick` (0: none since the line's last write) into `slot` of a
 	// host-visible buffer. An operation that writes a line clears its tick and queues it for a
