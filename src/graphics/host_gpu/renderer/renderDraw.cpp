@@ -1245,7 +1245,7 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 static void RefreshShaderPrograms(PipelineCache& pipeline_cache, const HW::Context& ctx,
                                   const HW::Shader& sh_ctx, const HW::UserConfig& user_config,
                                   uint32_t color_output_mask, DrawRenderState& state,
-                                  ProgramResolution* ahead) {
+                                  ProgramResolution* ahead, bool allow_deferred = false) {
 	const auto& vertex_shader_info = sh_ctx.GetVs();
 	const auto& pixel_shader_info  = sh_ctx.GetPs();
 	const auto& shader_regs        = ctx.GetShaderRegisters();
@@ -1265,17 +1265,18 @@ static void RefreshShaderPrograms(PipelineCache& pipeline_cache, const HW::Conte
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, user_config, target_export_mapping,
-	    state.ps_active, state.vertex_info, state.ps_input_info, ahead);
+	    state.ps_active, state.vertex_info, state.ps_input_info, ahead, allow_deferred);
 }
 
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           uint32_t color_output_mask, DrawRenderState& state) {
+                           uint32_t color_output_mask, DrawRenderState& state,
+                           bool allow_deferred = false) {
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
 	RefreshShaderPrograms(buffer.GetContext().GetPipelineCache(), buffer.GetRegisters(),
 	                      buffer.GetShaders(), buffer.GetUserConfig(), color_output_mask, state,
-	                      nullptr);
+	                      nullptr, allow_deferred);
 }
 
 static bool PixelShaderActive(const HW::Context& ctx, const HW::Shader& shaders,
@@ -1411,6 +1412,25 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
 	return true;
 }
 
+// Whether the draw may be skipped while a worker compiles one of its programs: as
+// DrawOnlyChangesPicture() for pipelines, no guest occlusion counter sees its samples and it
+// renders to no linear color target (the CPU reads those back); its programs' memory writes are
+// checked by the pipeline cache. Linear depth targets are not used as CPU-read images.
+static bool DrawMayWaitForShaders(RenderContext& context, const HW::Context& registers,
+                                  uint32_t color_output_mask) {
+	if (!Config::AsyncPipelinesEnabled() || context.GetOcclusionQueries().Counting()) {
+		return false;
+	}
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		const auto& target = registers.GetRenderTarget(slot);
+		if ((color_output_mask & (1u << slot)) != 0 && target.base.addr != 0 &&
+		    target.attrib3.tile_mode == Prospero::TileMode::kLinear) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
                                             const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
@@ -1419,7 +1439,12 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 	if (!shaders_resolved) {
 		state.ps_active =
 		    PixelShaderActive(buffer.GetRegisters(), buffer.GetShaders(), color_output_mask);
-		RefreshShaders(buffer, draw, color_output_mask, state);
+		RefreshShaders(buffer, draw, color_output_mask, state,
+		               DrawMayWaitForShaders(m_context, buffer.GetRegisters(), color_output_mask));
+		if (state.programs.pending) {
+			// Skipped until a compile worker added the missing permutation (KYTY_ASYNC_SHADERS).
+			return false;
+		}
 	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {

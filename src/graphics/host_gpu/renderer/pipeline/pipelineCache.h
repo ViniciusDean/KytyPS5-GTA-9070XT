@@ -195,6 +195,9 @@ public:
 	struct GraphicsPrograms {
 		std::array<ShaderProgram, 3> vertex;
 		ShaderProgram pixel;
+		// A program of the draw is being compiled by a worker (see `allow_deferred`): the draw
+		// must be skipped; the other stages are not resolved.
+		bool pending = false;
 
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
@@ -205,7 +208,8 @@ public:
 	                    const HW::Context& context, const HW::UserConfig& user_config,
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info, ProgramResolution* ahead = nullptr);
+	                    ShaderPixelInputInfo& pixel_info, ProgramResolution* ahead = nullptr,
+	                    bool allow_deferred = false);
 	// With `ahead`, only a program and permutation that exist, reading guest memory through the
 	// resolution's log (see GetGraphicsPrograms).
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,

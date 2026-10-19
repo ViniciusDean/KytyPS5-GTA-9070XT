@@ -396,6 +396,16 @@ bool ShaderStealEnabled() {
 	return enabled;
 }
 
+// KYTY_ASYNC_SHADERS=0: a draw that misses a permutation of a known program compiles it on the
+// execution thread instead of queueing it to a worker and being skipped until it is ready.
+bool AsyncShadersEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_SHADERS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 uint64_t NowNanoseconds() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -419,6 +429,8 @@ struct ShaderStats {
 	std::atomic_uint64_t wait_ns {0};
 	std::atomic_uint64_t steal_count {0};
 	std::atomic_uint64_t steal_ns {0};
+	// Draws skipped while a worker compiles one of their programs (KYTY_ASYNC_SHADERS).
+	std::atomic_uint64_t deferred_draws {0};
 	std::atomic_uint64_t last_print_ms {0};
 };
 ShaderStats g_shader_stats;
@@ -782,6 +794,10 @@ struct PipelineCache::ProgramCache {
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
+		if (deferred) {
+			// The draw is skipped: its other stages need not resolve.
+			return {};
+		}
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -833,6 +849,24 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		// A permutation miss of a known program, in a draw whose skipping only changes the picture:
+		// a worker compiles it and the draw is skipped until it is there (a moment of pop-in),
+		// instead of the execution thread compiling it (~100 ms each in an area transition).
+		if (defer_allowed && stage != ShaderType::Compute && entry != programs.end() &&
+		    !entry->second.call_source && !source_changed && defer_safe && defer_safe()) {
+			auto& attempts = defer_attempts[lookup_key];
+			if (in_flight.contains(lookup_key)) {
+				deferred = true;
+				return {};
+			}
+			if (attempts < MaxDeferAttempts) {
+				attempts++;
+				QueueCompile(stage, params, input_info, push_data_cursor,
+				             &entry->second.specialization);
+				deferred = true;
+				return {};
+			}
+		}
 		// A worker may be compiling this program: use it once it is there.
 		if (WaitForCompile()) {
 			return Get(params, input_info, push_data_cursor);
@@ -952,6 +986,49 @@ struct PipelineCache::ProgramCache {
 		bool                                                        stored = false;
 	};
 	static constexpr uint32_t CompileWorkers = 6;
+
+	// Under the program lock, for one exec-thread resolution (see GetGraphicsPrograms()): whether
+	// a permutation miss may be queued instead of compiled, the check that every stage of the
+	// draw is a known program without memory writes, and whether a stage was deferred.
+	bool                  defer_allowed = false;
+	std::function<bool()> defer_safe;
+	bool                  deferred = false;
+	// Deferred compiles queued per program: a program whose worker compile keeps failing is
+	// compiled by the execution thread (which reports the error) instead of skipping its draws.
+	std::unordered_map<ProgramKey, uint32_t, ProgramKeyHash> defer_attempts;
+	static constexpr uint32_t MaxDeferAttempts = 64;
+
+	// Under the program lock: true when the program of params/input_info has been compiled and
+	// none of its permutations writes memory (skipping its draw only changes the picture).
+	template <typename InputInfo>
+	bool KnownWithoutWrites(const ShaderParams& params, const InputInfo& input_info) const {
+		ProgramKey key;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			key.stage = input_info.logical_stage;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			key.stage = ShaderType::Pixel;
+		} else {
+			return false;
+		}
+		key.hash            = params.hash;
+		key.user_data_count = params.user_data_count;
+		key.code_size       = static_cast<uint32_t>(params.code.size());
+		BuildStageStaticKey(input_info, key.static_state);
+		AppendNativeRayTracingKey(key.stage, params.hash, key.static_state);
+		const auto entry = programs.find(key);
+		if (entry == programs.end() || entry->second.call_source ||
+		    entry->second.permutations.empty()) {
+			return false;
+		}
+		return std::ranges::none_of(entry->second.permutations, [](const Permutation& permutation) {
+			const auto& program = permutation.program;
+			return program.has_address_writes ||
+			       std::ranges::any_of(program.info.buffers,
+			                           [](const auto& buffer) { return buffer.written; }) ||
+			       std::ranges::any_of(program.info.images,
+			                           [](const auto& image) { return image.written; });
+		});
+	}
 
 	std::atomic_flag* program_lock = nullptr;
 	// Under the program lock: programs a worker is compiling, with their number of jobs.
@@ -1985,6 +2062,7 @@ void PipelineCache::PrintShaderStats() {
 	const auto wait_ns       = g_shader_stats.wait_ns.exchange(0, std::memory_order_relaxed);
 	const auto steal_count   = g_shader_stats.steal_count.exchange(0, std::memory_order_relaxed);
 	const auto steal_ns      = g_shader_stats.steal_ns.exchange(0, std::memory_order_relaxed);
+	const auto deferred      = g_shader_stats.deferred_draws.exchange(0, std::memory_order_relaxed);
 	size_t     queued_jobs   = 0;
 	{
 		std::lock_guard lock(m_program_cache->job_mutex);
@@ -2023,13 +2101,14 @@ void PipelineCache::PrintShaderStats() {
 	// Execution thread: inline compiles, waits for workers (including stolen jobs), stolen jobs;
 	// jobs still queued for the workers.
 	std::printf("[%02d:%02d:%02d] Shader exec: inline=%llu/%llu ms wait=%llu/%llu ms "
-	            "stolen=%llu/%llu ms queued=%zu\n",
+	            "stolen=%llu/%llu ms queued=%zu deferred_draws=%llu\n",
 	            tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<unsigned long long>(inline_count),
 	            static_cast<unsigned long long>(inline_ns / 1000000),
 	            static_cast<unsigned long long>(wait_count),
 	            static_cast<unsigned long long>(wait_ns / 1000000),
 	            static_cast<unsigned long long>(steal_count),
-	            static_cast<unsigned long long>(steal_ns / 1000000), queued_jobs);
+	            static_cast<unsigned long long>(steal_ns / 1000000), queued_jobs,
+	            static_cast<unsigned long long>(deferred));
 	std::fflush(stdout);
 }
 
@@ -2038,7 +2117,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
-    ProgramResolution* ahead) {
+    ProgramResolution* ahead, bool allow_deferred) {
 	PrintShaderStats();
 	const ResolveStatsScope resolve_scope;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
@@ -2181,11 +2260,35 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 		return ahead->reads.Failed() ? GraphicsPrograms {} : result;
 	}
+	auto& cache          = *m_program_cache;
+	cache.deferred       = false;
+	cache.defer_allowed  = allow_deferred && AsyncShadersEnabled();
+	std::optional<bool> safe;
+	if (cache.defer_allowed) {
+		cache.defer_safe = [&] {
+			if (!safe) {
+				bool known = !pixel_active || cache.KnownWithoutWrites(pixel_params, pixel_info);
+				for (uint32_t i = 0; i < (tess_active ? 3u : 1u) && known; i++) {
+					known = cache.KnownWithoutWrites(vertex_params[i], vertex_info[i]);
+				}
+				safe = known;
+			}
+			return *safe;
+		};
+	}
 	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.pixel = cache.Get(pixel_params, pixel_info, push_data_cursor);
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		result.vertex[i] = cache.Get(vertex_params[i], vertex_info[i], push_data_cursor);
+	}
+	result.pending      = cache.deferred;
+	cache.deferred      = false;
+	cache.defer_allowed = false;
+	cache.defer_safe    = nullptr;
+	if (result.pending) {
+		g_shader_stats.deferred_draws.fetch_add(1, std::memory_order_relaxed);
+		return GraphicsPrograms {.pending = true};
 	}
 	return result;
 }
