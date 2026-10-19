@@ -1542,6 +1542,12 @@ void PipelineCache::OpenStores(const std::string& title_id) {
 	}
 }
 
+namespace {
+// Why stored pipelines were not created ahead (reported with the pipeline store's result).
+std::atomic_uint32_t g_precreate_missing_program {0};
+std::atomic_uint32_t g_precreate_failed {0};
+} // namespace
+
 void PipelineCache::PrecreatePipelines(const std::stop_token& stop) {
 	KYTY_PROFILER_THREAD("Thread_PipelinePrecreate");
 	// The programs of the pipelines come from the program store: wait until it is compiled.
@@ -1565,8 +1571,10 @@ void PipelineCache::PrecreatePipelines(const std::stop_token& stop) {
 		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		                    std::chrono::steady_clock::now() - state.start)
 		                    .count();
-		PipelineCacheLog("Pipeline store: created {} of {} stored pipelines in {} ms",
-		                 state.created.load(), state.pipelines.size(), ms);
+		PipelineCacheLog("Pipeline store: created {} of {} stored pipelines in {} ms ({} without "
+		                 "their compiled programs, {} failed to create)",
+		                 state.created.load(), state.pipelines.size(), ms,
+		                 g_precreate_missing_program.load(), g_precreate_failed.load());
 	}
 }
 
@@ -1580,6 +1588,9 @@ bool PipelineCache::PrecreatePipeline(const StoredPipeline& stored) {
 		for (size_t i = 0; i < stored.programs.size(); i++) {
 			programs[i] = m_program_cache->FindProgram(stored.programs[i]);
 			if (programs[i] == nullptr) {
+				// Its permutation was not compiled from the program store (a program of an
+				// earlier build, or one the workers could not compile).
+				g_precreate_missing_program.fetch_add(1, std::memory_order_relaxed);
 				return false;
 			}
 		}
@@ -1657,6 +1668,7 @@ bool PipelineCache::PrecreatePipeline(const StoredPipeline& stored) {
 		return true;
 	} catch (const Common::SoftExitError&) {
 		// The pipeline is created again when a draw needs it, and fails there if it still does.
+		g_precreate_failed.fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}
 }
