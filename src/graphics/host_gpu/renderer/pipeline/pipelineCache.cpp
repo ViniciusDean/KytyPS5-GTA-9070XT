@@ -390,6 +390,16 @@ bool ShaderJobPriorityEnabled() {
 
 // KYTY_SHADER_STEAL=0: the execution thread waits for a queued compile of the program it needs
 // instead of taking the job and compiling it itself.
+// KYTY_SHADER_WAIT_OTHERS=1: the execution thread also waits for workers compiling other
+// permutations of the program it needs (by default it compiles its own one right away).
+bool ShaderWaitOthersEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHADER_WAIT_OTHERS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 bool ShaderStealEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_SHADER_STEAL");
@@ -935,7 +945,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		// A worker may be compiling this program: use it once it is there.
-		if (WaitForCompile()) {
+		if (WaitForCompile(entry != programs.end() ? &entry->second.specialization : nullptr)) {
 			return Get(params, input_info, push_data_cursor);
 		}
 		const auto inline_start       = ShaderStatsEnabled() ? NowNanoseconds() : 0;
@@ -1114,6 +1124,11 @@ struct PipelineCache::ProgramCache {
 	std::atomic_flag* program_lock = nullptr;
 	// Under the program lock: programs a worker is compiling, with their number of jobs.
 	std::unordered_map<ProgramKey, uint32_t, ProgramKeyHash> in_flight;
+	// Under the program lock: the specialization each running worker job compiles (none: the
+	// worker materializes it itself).
+	std::unordered_multimap<ProgramKey,
+	                        std::optional<ShaderRecompiler::IR::ResourceSpecialization>, ProgramKeyHash>
+	    running;
 	std::mutex                                     job_mutex;
 	std::condition_variable                        job_available;
 	std::deque<std::unique_ptr<CompileJob>>        jobs;
@@ -1167,7 +1182,7 @@ struct PipelineCache::ProgramCache {
 
 	// Execution thread, under the program lock: waits without the lock until no worker compiles
 	// the program of lookup_key. False when none did.
-	bool WaitForCompile() {
+	bool WaitForCompile(const ShaderRecompiler::IR::ResourceSpecialization* needed = nullptr) {
 		if (!in_flight.contains(lookup_key)) {
 			return false;
 		}
@@ -1209,6 +1224,23 @@ struct PipelineCache::ProgramCache {
 					g_shader_stats.steal_ns.fetch_add(NowNanoseconds() - steal_start,
 					                                  std::memory_order_relaxed);
 				}
+			}
+		}
+		if (needed != nullptr && !ShaderWaitOthersEnabled()) {
+			// Every remaining job of the program runs on a worker for another permutation: they
+			// cannot give this draw its program, so compile it now instead of waiting for them
+			// first (the execution thread waited seconds for the other permutations of large
+			// programs). Jobs that materialize their own specialization might be this one: wait.
+			const auto in_flight_jobs = in_flight.find(key);
+			uint32_t   others         = 0;
+			bool       maybe_needed   = false;
+			for (auto [first, last] = running.equal_range(key); first != last; ++first) {
+				others++;
+				maybe_needed |= !first->second || *first->second == *needed;
+			}
+			if (in_flight_jobs != in_flight.end() && others == in_flight_jobs->second &&
+			    !maybe_needed) {
+				return false;
 			}
 		}
 		const auto running_start = NowNanoseconds();
@@ -1312,6 +1344,12 @@ struct PipelineCache::ProgramCache {
 		if (const auto job_count = in_flight.find(job.key); --job_count->second == 0) {
 			in_flight.erase(job_count);
 		}
+		for (auto [first, last] = running.equal_range(job.key); first != last; ++first) {
+			if (first->second == job.specialization) {
+				running.erase(first);
+				break;
+			}
+		}
 		UnlockPrograms();
 		if (const auto slow = SlowShaderLogMs(); slow != 0) {
 			const auto total_ms = (NowNanoseconds() - job_start) / 1000000;
@@ -1357,6 +1395,9 @@ struct PipelineCache::ProgramCache {
 				job = std::move(jobs.front());
 				jobs.pop_front();
 			}
+			LockPrograms();
+			running.emplace(job->key, job->specialization);
+			UnlockPrograms();
 			if (job->vertex != nullptr) {
 				RunCompileJob(*job, *job->vertex);
 			} else if (job->pixel != nullptr) {
