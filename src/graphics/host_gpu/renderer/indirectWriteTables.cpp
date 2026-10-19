@@ -121,6 +121,7 @@ bool IndirectWriteTables::Prepare(uint64_t address, uint64_t size) {
 	auto& buffer_cache = m_context.GetBufferCache();
 	if (buffer_cache.HasGpuDirtyBytes(address, bytes)) {
 		// The guest copy of a table the GPU wrote is stale: download it before scanning.
+		const BufferCache::OriginScope origin(BufferCache::ReadbackOrigin::IndirectWriteTable);
 		buffer_cache.ReadMemory(address, bytes);
 		full = true;
 	}

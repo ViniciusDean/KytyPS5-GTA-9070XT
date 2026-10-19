@@ -50,6 +50,34 @@ public:
 		Count
 	};
 
+	// What a GPU thread's own readback is for (KYTY_READBACK_STATS): callers tag it with
+	// OriginScope; untagged ones are faults of a GPU thread on protected memory.
+	enum class ReadbackOrigin : uint8_t {
+		Fault,                // a GPU thread touched protected GPU-written memory
+		ShaderSpecialization, // V#/T#/constants a shader is specialized on (SRT walks)
+		TextureMetadata,      // DCC/HTILE metadata the texture cache inspects
+		IndirectWriteTable,   // an indirect write table scanned before a dispatch
+		DispatchIndirectArgs, // workgroup counts of an indirect dispatch (LDS sizing)
+		DispatchThreadArgs,   // thread counts of a dispatch (LDS kept in a device buffer)
+		Count
+	};
+	class OriginScope {
+	public:
+		explicit OriginScope(ReadbackOrigin origin) noexcept: m_previous(t_origin) { t_origin = origin; }
+		~OriginScope() { t_origin = m_previous; }
+		OriginScope(const OriginScope&)            = delete;
+		OriginScope& operator=(const OriginScope&) = delete;
+
+	private:
+		ReadbackOrigin m_previous;
+	};
+	static inline thread_local ReadbackOrigin t_origin = ReadbackOrigin::Fault;
+	// Per readback, on the thread that runs it: time spent waiting for the GPU on the readback
+	// queue, time spent draining the GPU (the fallback), and whether it drained.
+	static inline thread_local uint64_t t_queue_wait_us = 0;
+	static inline thread_local uint64_t t_drain_us      = 0;
+	static inline thread_local bool     t_drained       = false;
+
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
@@ -374,6 +402,7 @@ private:
 	// True when bytes were copied back.
 	bool ReadMemorySync(uint64_t vaddr, uint64_t size, bool is_write);
 	void RecordSyncReadback(SyncReason reason, uint64_t start, bool downloaded);
+	void RecordGpuThreadReadback(uint64_t start, uint64_t size, bool downloaded);
 	void PrintReadbackStats();
 	std::array<AsyncReadback, PendingReadbackWindows::Capacity> m_async_readbacks;
 	PendingReadbackWindows                                     m_pending_readbacks;
@@ -388,6 +417,12 @@ private:
 		std::array<std::atomic_uint64_t, static_cast<size_t>(SyncReason::Count)> reason_count {};
 		std::array<std::atomic_uint64_t, static_cast<size_t>(SyncReason::Count)> reason_us {};
 		std::array<std::atomic_uint64_t, static_cast<size_t>(SyncReason::Count)> reason_hits {};
+		std::array<std::atomic_uint64_t, static_cast<size_t>(ReadbackOrigin::Count)> origin_count {};
+		std::array<std::atomic_uint64_t, static_cast<size_t>(ReadbackOrigin::Count)> origin_us {};
+		std::array<std::atomic_uint64_t, static_cast<size_t>(ReadbackOrigin::Count)> origin_bytes {};
+		std::array<std::atomic_uint64_t, static_cast<size_t>(ReadbackOrigin::Count)> origin_wait_us {};
+		std::array<std::atomic_uint64_t, static_cast<size_t>(ReadbackOrigin::Count)> origin_drain_us {};
+		std::array<std::atomic_uint64_t, static_cast<size_t>(ReadbackOrigin::Count)> origin_drains {};
 	};
 	ReadbackStats m_readback_stats;
 	// The mirror: each line holds a copy of its bytes in a cached buffer, recorded at the end of

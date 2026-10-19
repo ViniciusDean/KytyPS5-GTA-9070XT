@@ -251,6 +251,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	}
 	auto& cache = context.GetBufferCache();
 	if (indirect_args != 0) {
+		const BufferCache::OriginScope origin(BufferCache::ReadbackOrigin::DispatchIndirectArgs);
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));
@@ -632,6 +633,7 @@ void RenderExecutor::DispatchIndirectThreads(uint64_t submit_id, CommandBuffer& 
 	if (program.bindings.descriptor_counts[static_cast<size_t>(
 	        ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory)] != 0) {
 		// LDS kept in a device buffer is sized by the workgroup count: read the thread counts.
+		const BufferCache::OriginScope origin(BufferCache::ReadbackOrigin::DispatchThreadArgs);
 		m_context.GetBufferCache().ReadMemory(args_addr, ArgsSize);
 		const auto* threads = reinterpret_cast<const uint32_t*>(args_addr);
 		const uint32_t group_sizes[] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,

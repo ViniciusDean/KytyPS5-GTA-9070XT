@@ -171,6 +171,11 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+namespace {
+bool     ReadbackStatsEnabled();
+uint64_t NowMicros();
+} // namespace
+
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
@@ -256,9 +261,14 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.DeferPriorityOperation(std::move(publish), written_begin,
 		                                   written_end - written_begin);
 	} else {
-		const auto tick = m_scheduler.CurrentTick();
+		const auto drain_start = ReadbackStatsEnabled() ? NowMicros() : 0;
+		const auto tick        = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
+		if (ReadbackStatsEnabled()) {
+			t_drain_us += NowMicros() - drain_start;
+			t_drained = true;
+		}
 		publish();
 	}
 	return true;
@@ -458,6 +468,10 @@ constexpr std::array<const char*, static_cast<size_t>(BufferCache::SyncReason::C
                        "disabled",  "no-queue",    "bda-pend", "full",         "empty",
                        "out-of-buf", "pend-writes", "unsubmitted", "dropped"};
 
+constexpr std::array<const char*, static_cast<size_t>(BufferCache::ReadbackOrigin::Count)>
+    ReadbackOriginNames = {"fault", "shader-spec", "tex-meta", "indirect-table", "dispatch-ind",
+                           "dispatch-threads"};
+
 } // namespace
 
 void BufferCache::RecordSyncReadback(SyncReason reason, uint64_t start, bool downloaded) {
@@ -468,6 +482,21 @@ void BufferCache::RecordSyncReadback(SyncReason reason, uint64_t start, bool dow
 	m_readback_stats.reason_us[index].fetch_add(NowMicros() - start, std::memory_order_relaxed);
 	if (downloaded) {
 		m_readback_stats.reason_hits[index].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void BufferCache::RecordGpuThreadReadback(uint64_t start, uint64_t size, bool downloaded) {
+	const auto origin = static_cast<size_t>(t_origin);
+	const auto us     = NowMicros() - start;
+	m_readback_stats.origin_count[origin].fetch_add(1, std::memory_order_relaxed);
+	m_readback_stats.origin_us[origin].fetch_add(us, std::memory_order_relaxed);
+	if (downloaded) {
+		m_readback_stats.origin_bytes[origin].fetch_add(size, std::memory_order_relaxed);
+	}
+	m_readback_stats.origin_wait_us[origin].fetch_add(t_queue_wait_us, std::memory_order_relaxed);
+	m_readback_stats.origin_drain_us[origin].fetch_add(t_drain_us, std::memory_order_relaxed);
+	if (t_drained) {
+		m_readback_stats.origin_drains[origin].fetch_add(1, std::memory_order_relaxed);
 	}
 }
 
@@ -551,10 +580,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// access needs, so the readback runs before them instead of after the whole backlog (a
 	// frame of draws, 100-200 ms while an area streams in).
 	gpu.SendUrgentCommandSync([this, vaddr, size, is_write, reason] {
-		const auto start      = ReadbackStatsEnabled() ? NowMicros() : 0;
+		const auto start = ReadbackStatsEnabled() ? NowMicros() : 0;
+		t_queue_wait_us  = 0;
+		t_drain_us       = 0;
+		t_drained        = false;
 		const bool downloaded = ReadMemorySync(vaddr, size, is_write);
 		if (ReadbackStatsEnabled()) {
 			RecordSyncReadback(reason, start, downloaded);
+			if (reason == SyncReason::GpuThreadRead || reason == SyncReason::GpuThreadWrite) {
+				RecordGpuThreadReadback(start, size, downloaded);
+			}
 			PrintReadbackStats();
 		}
 	});
@@ -1284,6 +1319,7 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 		return false;
 	}
 	NoteReadbackWait(readback_begin, readback_end, device_address, false);
+	const auto wait_start = ReadbackStatsEnabled() ? NowMicros() : 0;
 	// The copy waits for the needed submission on the GPU, but must not be submitted before it:
 	// the driver may then block inside vkQueueSubmit, holding locks a submission of the
 	// recording thread (or a present) needs.
@@ -1359,6 +1395,9 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 		Common::SpinPause();
 	}
 	(void)device.resetFences(1, &m_readback.fence);
+	if (ReadbackStatsEnabled()) {
+		t_queue_wait_us += NowMicros() - wait_start;
+	}
 	// Earlier asynchronous publications of these bytes run first, as in the queued path.
 	m_scheduler.WaitPriorityOperations(needed);
 	staging.Invalidate(0, total_size);
@@ -1624,6 +1663,35 @@ void BufferCache::PrintReadbackStats() {
 		if (count != 0) {
 			// count/total exec-thread ms/readbacks that copied bytes
 			line += fmt::format(" {}={}/{}ms/{}", SyncReasonNames[i], count, us / 1000, hits);
+		}
+	}
+	// GPU threads' own readbacks by origin, the five costliest:
+	// origin=count/ms (queue wait ms, drain ms in N drains, bytes read back).
+	struct OriginLine {
+		size_t   index;
+		uint64_t count, us, bytes, wait_us, drain_us, drains;
+	};
+	std::vector<OriginLine> origins;
+	for (size_t i = 0; i < ReadbackOriginNames.size(); i++) {
+		OriginLine entry {i,
+		                  m_readback_stats.origin_count[i].exchange(0, std::memory_order_relaxed),
+		                  m_readback_stats.origin_us[i].exchange(0, std::memory_order_relaxed),
+		                  m_readback_stats.origin_bytes[i].exchange(0, std::memory_order_relaxed),
+		                  m_readback_stats.origin_wait_us[i].exchange(0, std::memory_order_relaxed),
+		                  m_readback_stats.origin_drain_us[i].exchange(0, std::memory_order_relaxed),
+		                  m_readback_stats.origin_drains[i].exchange(0, std::memory_order_relaxed)};
+		if (entry.count != 0) {
+			origins.push_back(entry);
+		}
+	}
+	std::ranges::sort(origins, [](const OriginLine& a, const OriginLine& b) { return a.us > b.us; });
+	if (!origins.empty()) {
+		line += " || gpu-read by origin:";
+		for (size_t i = 0; i < origins.size() && i < 5; i++) {
+			const auto& o = origins[i];
+			line += fmt::format(" {}={}/{}ms(wait {}ms, drain {}ms in {}, {} KB)",
+			                    ReadbackOriginNames[o.index], o.count, o.us / 1000, o.wait_us / 1000,
+			                    o.drain_us / 1000, o.drains, o.bytes / 1024);
 		}
 	}
 	std::printf("%s\n", line.c_str());

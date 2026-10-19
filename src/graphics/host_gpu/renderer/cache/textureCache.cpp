@@ -1250,6 +1250,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	uint32_t   known_value = 0;
 	const bool known_fill  = m_buffer_cache.KnownFill(range.address, range.size, known_value);
 	if (!known_fill && m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		const BufferCache::OriginScope origin(BufferCache::ReadbackOrigin::TextureMetadata);
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
