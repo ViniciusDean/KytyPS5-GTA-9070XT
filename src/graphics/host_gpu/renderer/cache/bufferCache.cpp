@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <ctime>
 #include <string>
 #include <array>
 #include <cstdio>
@@ -1653,7 +1654,11 @@ void BufferCache::PrintReadbackStats() {
 	const auto published = m_readback_stats.async_published.exchange(0, std::memory_order_relaxed);
 	const auto dropped   = m_readback_stats.async_dropped.exchange(0, std::memory_order_relaxed);
 	const auto wait_us   = m_readback_stats.async_wait_us.exchange(0, std::memory_order_relaxed);
-	std::string line = fmt::format("Readback stats ({} ms): sync={} (exec thread {} us) async={} "
+	const auto stamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+	std::tm    tm {};
+	localtime_s(&tm, &stamp);
+	std::string line = fmt::format("[{:02}:{:02}:{:02}] ", tm.tm_hour, tm.tm_min, tm.tm_sec);
+	line += fmt::format("Readback stats ({} ms): sync={} (exec thread {} us) async={} "
 	                                "published={} dropped={} (guest wait {} us) |",
 	                                now - last, sync, sync_us, started, published, dropped, wait_us);
 	for (size_t i = 0; i < SyncReasonNames.size(); i++) {
