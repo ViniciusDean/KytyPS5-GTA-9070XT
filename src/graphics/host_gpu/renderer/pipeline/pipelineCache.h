@@ -174,6 +174,11 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
+// KYTY_SLOW_SHADER_MS (default 500, 0: off): shader compiles and pipeline creations that take at
+// least this long are printed to the console with the time of day.
+[[nodiscard]] uint32_t SlowShaderLogMs();
+void                   LogSlowShader(const std::string& text);
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:

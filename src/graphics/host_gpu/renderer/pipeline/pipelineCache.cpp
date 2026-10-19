@@ -486,6 +486,66 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 	return hash;
 }
 
+uint32_t SlowShaderLogMs() {
+	static const uint32_t ms = [] {
+		const char* value = std::getenv("KYTY_SLOW_SHADER_MS");
+		return value == nullptr || value[0] == 0 ? 500u
+		                                         : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	return ms;
+}
+
+void LogSlowShader(const std::string& text) {
+	const auto stamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+	std::tm    tm {};
+	localtime_s(&tm, &stamp);
+	std::printf("[%02d:%02d:%02d] %s\n", tm.tm_hour, tm.tm_min, tm.tm_sec, text.c_str());
+	std::fflush(stdout);
+}
+
+namespace {
+// Filled by CompilePermutation() for the compile that called it (on its thread).
+thread_local uint64_t t_emit_ns     = 0;
+thread_local uint64_t t_module_ns   = 0;
+thread_local uint64_t t_spirv_words = 0;
+// Set while the execution thread runs a job it took from the workers.
+thread_local bool t_stolen_job = false;
+
+const char* StageLabel(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Vertex: return "VS";
+		case ShaderType::Pixel: return "PS";
+		case ShaderType::Compute: return "CS";
+		case ShaderType::Mesh: return "GS(mesh)";
+		case ShaderType::Local: return "LS";
+		case ShaderType::TessellationControl: return "HS";
+		case ShaderType::TessellationEvaluation: return "TES";
+		default: return "?";
+	}
+}
+
+// Field by field (the structures have padding bytes).
+uint64_t SpecializationDigest(const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	std::vector<uint32_t> words;
+	for (const auto& buffer: specialization.buffers) {
+		words.insert(words.end(), {buffer.packed_stride, static_cast<uint32_t>(buffer.descriptor_format),
+		                           buffer.descriptor_swizzle, uint32_t {buffer.zero_stride_oob},
+		                           uint32_t {buffer.scalar_empty}, buffer.indirect_root,
+		                           buffer.indirect_mapping_offset, buffer.indirect_search_iterations});
+	}
+	words.push_back(0xffffffffu);
+	for (const auto& image: specialization.images) {
+		words.insert(words.end(),
+		             {static_cast<uint32_t>(image.numeric_class), static_cast<uint32_t>(image.dimension),
+		              image.mip_count, static_cast<uint32_t>(image.conversion_format), image.shader_swizzle,
+		              image.indirect_root, image.indirect_mapping_offset, image.indirect_search_iterations,
+		              image.table, image.table_capacity, image.table_mapping_offset, image.table_entry_mask,
+		              uint32_t {image.cube}, uint32_t {image.fmask}});
+	}
+	return XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
+}
+} // namespace
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -576,8 +636,11 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
 	                               std::span<const uint32_t> function_code) {
+		const auto emit_start = NowNanoseconds();
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		t_emit_ns     = NowNanoseconds() - emit_start;
+		t_spirv_words = result.spirv.size();
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
 		                         options.maintenance8_enabled)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
@@ -586,7 +649,9 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
-		const auto module = CompileSPV(result.spirv, graphics.device);
+		const auto module_start = NowNanoseconds();
+		const auto module       = CompileSPV(result.spirv, graphics.device);
+		t_module_ns             = NowNanoseconds() - module_start;
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -873,7 +938,8 @@ struct PipelineCache::ProgramCache {
 		if (WaitForCompile()) {
 			return Get(params, input_info, push_data_cursor);
 		}
-		const auto inline_start = ShaderStatsEnabled() ? NowNanoseconds() : 0;
+		const auto inline_start       = ShaderStatsEnabled() ? NowNanoseconds() : 0;
+		const auto inline_total_start = NowNanoseconds();
 		const auto [options, stage_name] = MakeCompileOptions(stage, params, input_info);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		const auto push_data_start = push_data_cursor;
@@ -917,6 +983,19 @@ struct PipelineCache::ProgramCache {
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		g_shader_stats.compiles.fetch_add(1, std::memory_order_relaxed);
+		if (const auto slow = SlowShaderLogMs(); slow != 0) {
+			const auto total_ms = (NowNanoseconds() - inline_total_start) / 1000000;
+			if (total_ms >= slow) {
+				const bool rt = std::ranges::find(lookup_key.static_state, 0x52545041u) !=
+				                lookup_key.static_state.end();
+				LogSlowShader(fmt::format(
+				    "Slow shader (exec thread, inline): {} hash={:016x} spec={:016x}{} spirv={} KB | "
+				    "emit={} ms module={} ms total={} ms",
+				    StageLabel(stage), params.hash, SpecializationDigest(permutation.specialization),
+				    rt ? " native-RT" : "", t_spirv_words * 4 / 1024, t_emit_ns / 1000000,
+				    t_module_ns / 1000000, total_ms));
+			}
+		}
 		if (ShaderStatsEnabled()) {
 			g_shader_stats.inline_count.fetch_add(1, std::memory_order_relaxed);
 			g_shader_stats.inline_ns.fetch_add(NowNanoseconds() - inline_start,
@@ -1115,6 +1194,7 @@ struct PipelineCache::ProgramCache {
 				}
 				const auto steal_start = stats ? NowNanoseconds() : 0;
 				UnlockPrograms();
+				t_stolen_job = true;
 				if (job->vertex != nullptr) {
 					RunCompileJob(*job, *job->vertex);
 				} else if (job->pixel != nullptr) {
@@ -1122,6 +1202,7 @@ struct PipelineCache::ProgramCache {
 				} else {
 					RunCompileJob(*job, *job->compute);
 				}
+				t_stolen_job = false;
 				LockPrograms();
 				if (stats) {
 					g_shader_stats.steal_count.fetch_add(1, std::memory_order_relaxed);
@@ -1130,10 +1211,22 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 		}
+		const auto running_start = NowNanoseconds();
 		while (in_flight.contains(key)) {
 			UnlockPrograms();
 			std::this_thread::yield();
 			LockPrograms();
+		}
+		if (const auto slow = SlowShaderLogMs(); slow != 0) {
+			const auto waited_ms = (NowNanoseconds() - running_start) / 1000000;
+			if (waited_ms >= slow) {
+				const bool rt =
+				    std::ranges::find(key.static_state, 0x52545041u) != key.static_state.end();
+				LogSlowShader(fmt::format(
+				    "Slow shader wait (exec thread): {} hash={:016x}{} waited {} ms for a compile "
+				    "worker",
+				    StageLabel(key.stage), key.hash, rt ? " native-RT" : "", waited_ms));
+			}
 		}
 		if (stats) {
 			g_shader_stats.wait_count.fetch_add(1, std::memory_order_relaxed);
@@ -1148,6 +1241,9 @@ struct PipelineCache::ProgramCache {
 		std::optional<Permutation>                        permutation;
 		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 		const Permutation*                                          added = nullptr;
+		const auto job_start      = NowNanoseconds();
+		uint64_t   translate_ns   = 0;
+		t_emit_ns = t_module_ns = t_spirv_words = 0;
 		try {
 			Common::SoftExitScope soft_exit(true);
 			const auto [options, stage_name] =
@@ -1158,7 +1254,9 @@ struct PipelineCache::ProgramCache {
 			if (source.call) {
 				throw Common::SoftExitError("SWAPPC program");
 			}
+			const auto translate_start = NowNanoseconds();
 			auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+			translate_ns    = NowNanoseconds() - translate_start;
 			plan                = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			auto specialization = job.specialization;
 			if (!specialization) {
@@ -1215,6 +1313,24 @@ struct PipelineCache::ProgramCache {
 			in_flight.erase(job_count);
 		}
 		UnlockPrograms();
+		if (const auto slow = SlowShaderLogMs(); slow != 0) {
+			const auto total_ms = (NowNanoseconds() - job_start) / 1000000;
+			if (total_ms >= slow) {
+				const bool rt = std::ranges::find(job.key.static_state, 0x52545041u) !=
+				                job.key.static_state.end();
+				LogSlowShader(fmt::format(
+				    "Slow shader ({}): {} hash={:016x} spec={:016x}{}{} spirv={} KB | translate={} ms "
+				    "emit={} ms module={} ms total={} ms{}",
+				    t_stolen_job ? "exec thread, stolen job" : "compile worker",
+				    StageLabel(job.stage), job.params.hash,
+				    stored_specialization ? SpecializationDigest(*stored_specialization)
+				    : job.specialization ? SpecializationDigest(*job.specialization)
+				                         : 0ull,
+				    rt ? " native-RT" : "", job.stored ? " from-store" : "", t_spirv_words * 4 / 1024,
+				    translate_ns / 1000000, t_emit_ns / 1000000, t_module_ns / 1000000, total_ms,
+				    permutation ? "" : " (not compiled)"));
+			}
+		}
 		if (job.stored) {
 			stored_pending.fetch_sub(1, std::memory_order_release);
 		}
