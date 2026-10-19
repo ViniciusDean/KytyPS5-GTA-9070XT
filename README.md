@@ -1,299 +1,150 @@
-experimental
+# KytyPS5-GTA-9070XT
 
-# KytyPS5-GTA
+Fork de testes do [TheCruZ/KytyPS5-GTA](https://github.com/TheCruZ/KytyPS5-GTA) para rodar
+**GTA V de PS5 (PPSA04263)** no **KytyPS5** com **AMD RX 9070 XT (RDNA4)** e CPU Intel híbrida.
+O foco é o modo **Performance RT** com ray tracing por hardware.
 
-A fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused on running
-**Grand Theft Auto V (PS5, PPSA04263 / PPSA04264)**.
-
-This fork is always the latest upstream `main` plus a small set of fixes on top, one commit per
-fix. Fixes that are useful beyond GTA V are proposed upstream as pull requests.
-
-For everything about the emulator itself (features, system requirements, building, usage,
-licensing), read the [**original KytyPS5 README**](https://github.com/KytyPS5/KytyPS5#readme).
-
-Builds of this fork for Windows, macOS and Linux are published on the
-[**Releases**](https://github.com/TheCruZ/KytyPS5-GTA/releases) page (v1, v2, ...).
-
-> [!TIP]
-> 🎉 **Performance mode now reaches 50-60 fps in the city, even in the rain!**
+> **English summary:** experimental test fork of TheCruZ/KytyPS5-GTA tuned and measured on an
+> AMD RX 9070 XT + Intel i5-14600K. It stacks TheCruZ's native hardware ray tracing branch, his v12
+> shader work and performance commits from other forks, and adds an asynchronous guest fault
+> readback (based on carbonimax's idea, rewritten for this fork's multi-threaded GPU pipeline).
+> Driving in Performance RT went from ~16 to ~26 fps (median) so far. Builds are not published;
+> the branches are for testing only.
 
 > [!IMPORTANT]
-> KytyPS5 is not affiliated with Sony Interactive Entertainment, PlayStation or Rockstar Games.
-> The project does not distribute games or copyrighted system software. Use only game files that
-> you have obtained legally.
+> Builds experimentais, feitos e testados numa única máquina. Podem travar ou mostrar defeitos
+> gráficos. Para jogar de forma estável, use os
+> [**releases do TheCruZ**](https://github.com/TheCruZ/KytyPS5-GTA/releases).
+>
+> KytyPS5 não tem relação com a Sony Interactive Entertainment, PlayStation ou Rockstar Games.
+> Este repositório não distribui jogos nem software do sistema; use só arquivos obtidos
+> legalmente.
 
-## Status
+O README original, com o estado do jogo e as correções do TheCruZ, está
+[aqui](https://github.com/TheCruZ/KytyPS5-GTA#readme). Para o emulador em geral, veja o
+[README do KytyPS5](https://github.com/KytyPS5/KytyPS5#readme).
 
-- Boots to the main menu and plays the prologue in Performance, Performance RT and Fidelity modes.
-- The prologue can be completed and the game continues into Los Santos (Franklin and Lamar).
-- Performance on an RTX 3090 / Ryzen 9 5900X in Performance mode: 45-60 fps in the city,
-also at night in the rain with about 5000 draws a frame, and 60 fps in open places. It was
-about 12-13 fps before the GPU optimizations below.
-- **Red zone protection** is enabled by default in this fork (disable it with `--no-redzone` or
-the "Windows SysV red zone crash protection" launcher option). Without it the game crashes in
-its streaming thread.
+## Máquina de teste
 
-## Fork status
+| | |
+|---|---|
+| GPU | AMD Radeon RX 9070 XT (Adrenalin 32.0.32015.2008) |
+| CPU | Intel Core i5-14600K (6 P-cores + 8 E-cores) |
+| RAM | 32 GB |
+| Sistema | Windows 11 Pro |
+| Resolução | 2560x1440, tela cheia |
 
-- 62 commits on top of upstream `main` (synced 2026-10-17).
-- 🎉 13 fixes from this fork (three of them partly) are now part of upstream KytyPS5; 14 more were fixed
-there independently, five of them partly (see [Fixed upstream since the fork started](#fixed-upstream-since-the-fork-started)).
+## Branches
 
-## Fixed bugs and crashes
+O **`main` deste fork tem tudo junto**: é o `hwrt-v12-readback4` (RT por hardware do TheCruZ +
+v12 + todos os commits de desempenho abaixo + readback assíncrono + compilação fora da thread de execução) com este README. Ele **não**
+acompanha mais o `main` do TheCruZ. Os branches abaixo guardam cada etapa, do mais antigo para o
+mais novo:
 
-Each item is one commit on top of upstream `main`.
+| Branch | Base | O que tem |
+|---|---|---|
+| [`hwrt`](https://github.com/ViniciusDean/KytyPS5-GTA-9070XT/tree/hwrt) | `native-hardware-raytracing` do TheCruZ (95ba8da) | RT por hardware (`VK_KHR_ray_query`) antes da v12 |
+| [`gta-perf`](https://github.com/ViniciusDean/KytyPS5-GTA-9070XT/tree/gta-perf) | `hwrt` | correções de desempenho de outros forks (lista abaixo) |
+| [`gta-perf2`](https://github.com/ViniciusDean/KytyPS5-GTA-9070XT/tree/gta-perf2) | `gta-perf` | + cache de pipelines do carbonimax, #1285 do NeySlim, bitmap BDA com um único atomic OR |
+| [`hwrt-v12`](https://github.com/ViniciusDean/KytyPS5-GTA-9070XT/tree/hwrt-v12) | RT por hardware rebaseado (829bbda) | + os 7 commits de shader da v12 (EmK530) |
+| [`hwrt-v12-perf`](https://github.com/ViniciusDean/KytyPS5-GTA-9070XT/tree/hwrt-v12-perf) | `hwrt-v12` | + o que funcionou no `gta-perf`/`gta-perf2` e a saída do EcoQoS |
+| [`hwrt-v12-readback`](https://github.com/ViniciusDean/KytyPS5-GTA-9070XT/tree/hwrt-v12-readback) | `hwrt-v12-perf` | + **readback assíncrono** das faltas do jogo (melhor resultado até agora) |
+| [`hwrt-v12-readback2`](https://github.com/ViniciusDean/KytyPS5-GTA-9070XT/tree/hwrt-v12-readback2) | `hwrt-v12-readback` | + estatística por motivo, até 32 cópias pendentes, flush do command buffer e faltas de escrita assíncronas |
+| [`hwrt-v12-readback3`](https://github.com/ViniciusDean/KytyPS5-GTA-9070XT/tree/hwrt-v12-readback3) | `hwrt-v12-readback2` | + estatísticas de shader (DeepSeek), compilação de shader fora da thread de execução e draws adiados enquanto compila, origem dos `gpu-read` |
+| [`hwrt-v12-readback4`](https://github.com/ViniciusDean/KytyPS5-GTA-9070XT/tree/hwrt-v12-readback4) | `hwrt-v12-readback3` | + log de shaders lentos (`KYTY_SLOW_SHADER_MS`) e a thread de execução não espera workers que compilam outra permutação do mesmo programa (em teste) — **é o `main`** |
 
-### Crashes and unsupported shaders
+Commits de outros autores mantêm o autor original. O que foi trazido para cá:
 
-- **Skinning compute shaders**: stores through buffer descriptors (V#) picked from a descriptor
-table on the GPU.
-- **Ray-hit shading shader (Fidelity/RT)**: GPU-indexed texture (T#) tables are bound as
-bindless sampled-image arrays (upstream now looks T#s up in bounded image tables directly,
-one specialized image per T#, which GTA V's ray tracing heaps are too large for). Table
-elements whose image an earlier rebind replaced are rediscovered before their views are
-acquired ("texture requires rediscovery before final acquisition").
-- **Fidelity mode exit "scalar resource reads overlap a shader buffer write"**: the BVH build
-shaders read a header word before they write it; such reads are accepted when they provably
-precede the dispatch's own writes (written compute descriptors are now read normally upstream).
-- **Crash when a gamepad is remapped** by SDL.
-- **Fidelity mode device loss in PPSA04264** ("vkQueueSubmit failed: ErrorDeviceLost (-4)" or
-"Not implemented" in `masterSemaphore.cpp` after ~100 s): a prefix-sum shader of the ray-tracing
-BVH build reads a (flag, value) pair that other workgroups publish with a 64-bit atomic; the read
-was split into two 32-bit loads and could pair a new flag with an old value, corrupting the BVH
-until the shadow rays looped forever. Such reads are now one 64-bit atomic load.
-- **Fidelity and Performance RT exit on AMD GPUs** ("descriptor set does not fit a pool sized for
-it" in `descriptorHeap.cpp`): the emulator asked a descriptor pool for 32 sets of the ray tracing
-texture table at once and fewer after a failure, but AMD's driver keeps the room a failed
-allocation used, so an empty pool could not hold even one set. Pools are now asked only for the
-sets they have room for.
-- **Missing letters in the boot legal notice and other text**: the compute shader that copies
-glyphs into the font atlas reads the CPU-rasterized bitmaps through DMA; memory without a cached
-buffer read as zero, so glyphs on those pages stayed blank. DMA base registers are now cached
-before the shader runs.
-- **Crash at the car dealership (Franklin and Lamar)**: pixel shader `0xf6b18542ea0e938a` builds
-its sampler's border color word from lane data; the untrackable bits are now dropped (border
-color only) instead of failing the shader.
-- **Streaming crash late in the prologue** ("[RAGE] HDD Streamer" in zlib `inflate_fast`): zlib
-keeps locals in the SysV red zone, which Windows overwrites when it delivers the exceptions the
-emulator's memory tracking raises. Red zone protection is now enabled by default.
-- **Intermittent streaming crash** ("[RAGE] HDD Streamer" in zlib `inflate`/`inflate_fast`, about
-once every 100 sessions): the game maps the same direct-memory page again with `MAP_FIXED`
-while the streamer decompresses into it. The emulator replaces a mapping by unmapping and
-mapping it again, so for a moment the page was gone; guest accesses in that window now wait for
-the mapping and are retried.
-- **"depth attachment feedback loop is not supported by the host"** (seen on a Radeon RX 9060 XT):
-draws that sample the depth target they also write need two Vulkan extensions that some drivers
-lack. Without them the draw now samples a copy of the depth target taken just before it; GPUs
-with the extensions keep the previous path.
+- **AN0DIN**: o event flag acorda só as threads que ele libera (o GTA acordava threads à toa
+  ~50 mil vezes por segundo).
+- **romainhedouin**: não faz a operação travada de leitura e escrita quando não há sinal pendente.
+- **NeySlim**: partes do #1284 e do #1286; o #1285 (checagem de leituras escalares com intervalos
+  de escrita mesclados e busca binária).
+- **carbonimax**: o cache de pipelines não é regravado sem mudança nem perdido se a troca do
+  arquivo falhar; a ideia do readback assíncrono.
+- **nmzik**: cada palavra de PM4 `WRITE_DATA` é publicada uma única vez.
+- **fxpw / TheCruZ**: bit do bitmap de faltas BDA marcado com um único atomic OR.
+- **EmK530** (via v12 do TheCruZ): F16 nativo, leitura de constantes por uniform buffer, menos
+  instruções desperdiçadas.
 
-### Shader instruction accuracy
+## Medições
 
-- `V_CVT_PK_U16_U32` / `V_CVT_PK_I16_I32` saturate to 16 bits.
-- `V_FRACT_F32` / `V_FRACT_F16` / `V_FRACT_F64` results stay below 1.0 (`V_FRACT_F64` from PR #1
-by At0mC3, for PPSA04264).
-- Float inline constants read by 64-bit operands use their double-precision encoding.
-- Formatted stores convert to the unsigned 11/10-bit float formats.
+Performance RT, dirigindo pela cidade por uns 2 minutos. O fps vem do título da janela do
+emulador, amostrado a cada ~2 s; só entram amostras com a GPU acima de 30% (fora menus e pausa).
+As cenas não são idênticas entre as partidas, então diferenças de 2 a 3 fps estão dentro do ruído.
 
-### Rendering
+| Build | fps médio | Mediana | 10% piores | GPU | CPU total |
+|---|---|---|---|---|---|
+| `hwrt-v12` | 15,7 | 16 | 12 | 58% | 23% |
+| `hwrt-v12-perf` | 18–21 | 17–20 | 12–13 | 61–67% | 24–25% |
+| `hwrt-v12-perf` + `KYTY_GPU_SPIN_US=8000` | 21–24 | 22–23 | 15–18 | 46–54% | 32–35% |
+| `hwrt-v12-readback` (com spin 8000) | **27,4** | **26** | **17** | 55% | 35% |
 
-- Stencil and depth-bias dynamic state is set for every draw (Vulkan validation errors).
-- Page faults on pages that cache tracking protects outside the GPU-mapped ranges are resolved
-instead of reported as guest crashes.
-- **Vehicle damage**: cars no longer deform wildly in collisions (wheels pushed outside the body,
-car unable to drive) and snap back later. The CPU reads the damage textures the GPU renders;
-GPU-written linear images are now read back to guest memory by default.
-- **Ray tracing (Fidelity and Performance RT)**: GTA V's ray tracing dispatches run (BVH
-intersections are emulated in shaders on the GPU's regular shader cores) instead of being
-skipped, so ray-traced reflections and shadows are drawn (the scalar reads through GPU-selected
-V#s are now upstream).
-- **Occlusion queries**: the game's occlusion counters come from real Vulkan occlusion queries
-instead of always reading visible (the sun's lens flare showed through trees and light glows
-through walls). Counters reach the game by the next frame, so water reflections (Michael's pool)
-no longer flicker.
-- **Black smoke and particles**: smoke (Michael's cigar in Father/Son) and small particles render
-translucent instead of black. The game clears the particle depth target (R16 float) with a fast
-register clear that was ignored, so depth of field blurred the particles dark (decoding the
-16-bit clear values is now upstream).
-- **Green puddle reflections in the rain**: wet ground, puddles and car paint reflect the sky and
-buildings instead of the grass under the camera (or nothing), also when the camera turns. The game
-draws its reflection cube one face at a time and resolves each MSAA face into its layer; every
-face was resolved into layer 0.
-- **Disappearing trees**: the trunks of nearby trees are drawn. GTA V tessellates them up close;
-its tessellation shaders now translate and tessellation is enabled by default (disable it with
-`--no-tessellation` or the launcher option).
-- **Wrong water level**: the game's water physics saw a flat sea at a fixed level instead of the
-waves: boats and jet skis sank into the waves instead of riding them, and the water level seen from
-the swimming camera was wrong (with black areas on the water). The physics read the origin of the
-GPU-simulated wave grid from a small tiled render target that never reached guest memory; small
-GPU-written tiled images are now written back like linear ones.
+Para comparação, o `hwrt` antigo dava ~19 fps em Performance RT e ~60 fps em Performance (sem RT).
+Com o carro parado, o Performance RT fica entre 35 e 60 fps, com a GPU entre 70 e 88%.
 
-### Performance
+## O que descobrimos
 
-- Bindless tables: resolved elements are cached between dispatches and only re-resolved when
-their memory changes.
-- Reused bindless tables rebind only the slots that changed, and draws keep the texture
-descriptions of the slots that did not change (about +3 % in Performance mode).
-- Buffer device address synchronization only visits CPU-dirty pages and is skipped when nothing
-changed (this replaces the queue of changed ranges of upstream's d58aefde).
-- Render-target fast clears whose metadata a compute shader filled no longer read the metadata
-back from the GPU.
-- The Vulkan pipeline cache is written every minute by a background thread instead of by the GPU
-thread every five minutes, so a crash loses less and the draws do not stall during the write
-(upstream now keeps the cache across emulator builds, since d58aefde, and checkpoints it every
-five minutes, since 959bee47).
-- RELEASE_MEM label writes no longer submit a command buffer each (about 200 submits per frame
-down to about 20).
-- The per-draw render state is reused instead of zeroing 36 KiB per draw.
-- Guest memory reads and range clamps on the GPU thread resolve their mapping without the global
-memory lock (per-thread caches validated by a mapping generation).
-- Buffer device address synchronization only visits tracking regions dirtied since the last one.
-- Shader resource tables are evaluated through a compiled node graph per resource plan (about
-3.8x faster than interpreting the IR on every draw).
-- Shader stage lookup keys are built without per-word vector work.
-- The emulated GPU runs as a pipeline of dedicated threads pinned to their own cores (command
-processor, draw resolution, execution and Vulkan recording) instead of one thread.
-- Shader programs, resource tables and vertex fetch tables are resolved ahead of execution, and
-the shaders of a new area compile on six worker threads.
-- Unmapping memory drains the GPU only when the range holds GPU data or a guest-memory
-completion is pending (it drained about 12 times per frame while streaming).
-- Streaming no longer stalls frames for 80-280 ms: unmaps run ahead of the emulated GPU's
-backlog, and the guest memory map is updated and queried without linear scans or lock
-contention (upstream now also keeps its range list in an ordered map, since f7ae86c9).
-- Per-draw texture, render-target and image lookups are cached; deleted Vulkan images are
-recycled instead of reallocated.
-- Indirect draws and indirect dispatches whose arguments the GPU writes (grass and foliage
-culling, ray tracing) run from those arguments on the host GPU instead of reading them back:
-the scene near the mountain went from about 34 to 60 fps.
-- Reads and command-processor writes next to GPU-written data no longer drain the GPU, and
-GPU-written bytes are read back on a transfer queue that waits only for their last writer.
-- The Vulkan pipelines of earlier sessions are created on background threads while the game
-loads, so a new build no longer stalls on every new pipeline.
-- **No more stutter the first time something is drawn**: the driver needs up to half a second
-to compile each new pipeline, and the game used to stop while it did (places seen for the
-first time dropped to about 18 fps). New pipelines are now compiled in the background and the
-draws that need them are skipped meanwhile, so an object may appear a moment late the first
-time it is seen while the game keeps running at 40-60 fps. Draws whose results the game reads
-back (memory writes, occlusion queries, vehicle damage) still wait. Disable it with
-`--no-async-pipelines` or the launcher option.
-- **Less slowdown in long sessions**: cached GPU buffers were only released under memory pressure,
-so they piled up (from ~350 to ~14,000 in 25 minutes) and every frame kept uploading and
-write-protecting memory the game had reused. Buffers that neither the emulator nor any shader
-used for about 30 seconds are now released (shaders mark the pages they reach through device
-addresses). In a fixed scene after 25 minutes: about 46 fps before, about 52 fps after, the same
-as at the start. The game's sequential writes to protected memory take one fault per 64 KB
-instead of one per page.
-- A vertex shader that reads its vertex buffer descriptors from a table made every draw upload
-all the memory the CPU had written (about 16 MB a frame) and protect it again, so the game took
-about 2700 write faults a frame. The emulator now works out which memory a shader can reach
-through such tables and uploads only that.
-- Small per-draw constants reuse the copy made earlier in the same batch of draws, and the lookup
-of guest memory mappings for those copies is cached per 64 KB.
-- Fewer per-draw checks: the buffers a draw writes are collected once, image use is recorded once
-per frame step, and reads of memory the GPU has not written skip the GPU-written checks.
-- The address space lock is taken shared for the temporary protection changes of the page manager, so they no longer exclude the game's page faults (about +3-5 % in Fidelity with native ray tracing, neutral in Performance mode).
-- **Faster shaders on NVIDIA and other 32-wide GPUs** (seven commits by EmK530, from
-[PR #3](https://github.com/TheCruZ/KytyPS5-GTA/pull/3); in GTA V on an RTX 50 GPU it went from
-88 to 136 fps according to the PR): wave64 compute workgroups run as two 32-wide host subgroups
-(one guest lane per invocation, instead of two lanes per invocation), packed and scalar F16
-arithmetic runs as native half-float operations instead of going through F32, and buffers that
-are only read as constants at small immediate offsets are read through uniform buffer views
-(the constant cache). Masked selects whose old value is never read are dropped, and float
-min/max use `NMin`/`NMax`. The new paths need the `shaderFloat16` and
-`uniformBufferStandardLayout` device features. Each can be turned off with an environment
-variable to compare or work around a problem: `KYTY_WAVE64_WARPS=0` (split waves),
-`KYTY_NATIVE_F16=0` (native F16) and `KYTY_UNIFORM_BUFFERS=0` (uniform buffer views).
+- **Dirigindo, o limite não é a GPU.** Ela fica em 45–60% e nenhuma thread do emulador chega a
+  100% de um núcleo: a mais ocupada fica em ~80%. O tempo vai em **esperas de sincronização**
+  entre as threads do emulador e a GPU, enquanto o jogo carrega a cidade.
+- **A compilação de shaders não é a causa.** Com o cache aquecido, entram só 2 a 8 shaders novos
+  por minuto, sem relação com as quedas.
+- **Readback síncrono é uma das esperas.** Quando o jogo lê memória que a GPU escreveu, a thread de
+  execução da GPU parava até a cópia terminar. O `hwrt-v12-readback` faz a cópia sem bloquear essa
+  thread, e quem espera é só a thread do jogo que pediu os dados. Numa sessão de 5 minutos:
+  - ~14 mil leituras foram pelo caminho novo (só 220 descartadas e refeitas);
+  - ~57 mil (80%) ainda foram síncronas e custaram 16,4 s à thread de execução, chegando a
+    ~21% do tempo dela nos piores trechos.
+- **Spin mais longo ajuda um pouco.** Com `KYTY_GPU_SPIN_US=8000` as threads da GPU giram mais
+  antes de dormir no kernel, o que reduz a latência entre elas, ao custo de mais CPU.
 
-### Controllers
+## Foco atual
 
-- Pads that are not DualSenses (Xbox style) no longer vibrate continuously while driving: the game
-sends the vehicle engine through the haptic audio port, meant for the DualSense actuators, and
-upstream turned that audio into rumble. Those pads now rumble only through the game's normal
-vibration requests (crashes, impacts); `--pad-haptic-rumble true` restores the rumble derived
-from haptic audio.
+1. **Levar mais leituras para o caminho assíncrono** (`hwrt-v12-readback2`): contar o motivo de
+   cada readback síncrono (falta de escrita, falta do processador de comandos, limite de 8
+   pendentes, escritas ainda sendo gravadas…) e ampliar o caminho novo para os mais comuns,
+   sem nunca publicar dado velho.
+2. **Travadas nas transições e no pause (~18 s):** nas trocas de área o emulador compilava ~136
+   shaders seguidos na thread de execução (~96 ms cada). O `hwrt-v12-readback3` tira essa
+   compilação da thread; no pause, a thread de execução chegou a esperar ~21 s por 6 shaders que
+   compilavam nos workers; o `hwrt-v12-readback4` registra quais são e para de esperar os de
+   outra permutação.
+3. **Medir o que ainda não foi medido:**
+   - a saída do EcoQoS, que nos testes acima estava desligada (`KYTY_POWER_THROTTLING=1`);
+   - o log em arquivo (`--printf-direction File` grava ~1 MB/s nas próprias threads que enviam
+     comandos para a GPU).
+4. **Acompanhar o TheCruZ:** rebasear quando o RT por hardware ou a v12 avançarem, evitando os
+   commits do upstream suspeitos da regressão das issues
+   [#1591](https://github.com/KytyPS5/KytyPS5/issues/1591) e
+   [#1626](https://github.com/KytyPS5/KytyPS5/issues/1626).
 
-## Fixed upstream since the fork started
+## Variáveis de ambiente
 
-These problems no longer need a fork commit: KytyPS5 fixed them in its own `main`.
+| Variável | Padrão | Efeito |
+|---|---|---|
+| `KYTY_SLOW_SHADER_MS` | 500 | registra no console compilações e esperas de shader acima desse tempo (0 desliga) |
+| `KYTY_SHADER_WAIT_OTHERS=1` | desligado | volta a esperar workers que compilam outra permutação do mesmo programa |
+| `KYTY_ASYNC_SHADERS=0` | ligado | não adia draws enquanto um shader compila (volta a compilar na thread de execução) |
+| `KYTY_SHADER_STEAL=0`, `KYTY_SHADER_JOB_PRIORITY=0` | ligados | thread de execução não compila o próprio job / shaders da sessão não passam na frente do store |
+| `KYTY_SHADER_STATS=1` | desligado | imprime a cada 5 s as estatísticas de shader no console |
+| `KYTY_ASYNC_READBACK=0` | ligado | desliga o readback assíncrono (volta ao comportamento antigo) |
+| `KYTY_READBACK_STATS=1` | desligado | imprime a cada 5 s uma linha `Readback stats:` no console |
+| `KYTY_POWER_THROTTLING=1` | desligado | mantém o power throttling (EcoQoS) do Windows; por padrão o emulador sai dele |
+| `KYTY_GPU_SPIN_US` | 2000 | quanto tempo (µs) as threads da GPU giram antes de dormir; testado com 8000 |
+| `KYTY_GPU_THREAD_CPUS` | 4,6,8,10,2 | núcleos das threads da GPU; `off` deixa o Windows escolher |
+| `KYTY_WAVE64_WARPS`, `KYTY_NATIVE_F16`, `KYTY_UNIFORM_BUFFERS` | ligados | chaves da v12 (EmK530); `=0` desliga cada uma |
 
-### Taken from this fork 🎉
+## Avisos
 
-Upstream commits co-authored by TheCruZ.
+- Não troque de modo gráfico com o jogo rodando: há relato de `ErrorDeviceLost` ao passar de
+  Performance RT para Performance.
+- O RT por hardware do TheCruZ ainda é experimental e pode ter falhas nas sombras.
+- Cada build mantém a própria lista de shaders em `_PipelineCache`, então a primeira partida
+  de um build novo engasga mais.
 
+## Créditos
 
-| Fix                                                                                                                  | Upstream commit    |
-| -------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| Fidelity mode device loss in the ray-tracing BVH build (the extra threads of a partial dispatch group stay inactive) | e4aca7a6, 0258bd61 |
-| Unsupported `v_bfrev_b32` with an SDWA source (BVH build shaders)                                                    | d890bb19           |
-| Ray-tracing buffers whose record count the shader computes                                                           | 8b05b673           |
-| Single-DWORD and `FORMAT_X` loads through GPU-selected V#s                                                           | a55a2838, 5f01308b |
-| Samplers built with `s_brev_b32` (constant-folded bit reverse)                                                       | 139b564c           |
-| `V_ALIGNBYTE_B32` uses only `S2[1:0]` as the byte offset                                                             | f18679e0           |
-| Scalar reads through GPU-selected V#s (ray tracing)                                                                  | b4d32394           |
-| Written compute descriptors read without an alias proof                                                              | ec3e48cd           |
-| `V_CMP(X)_GT_I64` / `V_CMP(X)_GE_I64`, the last 64-bit integer compares (from PR #1 by At0mC3)                       | d247d3d6           |
-| Deleting a depth image finds its stencil associations without scanning every cached image (long sessions)            | f4692a45           |
-| Partly: bounded material keys for the ray-hit material table                                                         | 843b5778, 1f6be3d5 |
-| Partly: 16-bit color fast-clear values (black cigar smoke in Father/Son)                                             | 57c97ebd           |
-| Partly: dynamic depth bounds, so deferred lights reuse their pipelines                                               | 98401022           |
-
-
-### Fixed by other upstream authors
-
-
-| Fix                                                                                            | Upstream commit |
-| ---------------------------------------------------------------------------------------------- | --------------- |
-| Invalid depth upload on shadow cube maps (partial depth views)                                 | 068d7621        |
-| `DS_MIN_F32` / `DS_MAX_F32` operands                                                           | e85279ea        |
-| Formatted stores to SNORM and USCALED/SSCALED                                                  | de9c15fa        |
-| Synchronous CPU readbacks published on the waiting thread                                      | 39e23ac9        |
-| Window title updates made presentation wait for the main thread (part of a performance commit) | 7415febd        |
-| 64-bit integer compares (all but `V_CMP(X)_GT/GE_I64`)                                         | bb98f264        |
-| V# bases selected by a scalar branch in shaders that write memory                              | 488c0aca        |
-| Texel offsets of `IMAGE_SAMPLE*_O` (runtime offsets need VK_KHR_maintenance8)                  | 984cfceb, 460a196f |
-| GPU-selected formatted loads share one load (Fidelity froze minutes compiling RT shaders)      | 9a7c54da        |
-| Partly: dynamic state a draw already set is not recorded again (part of a performance commit)  | 93452b24        |
-| Partly: the Vulkan pipeline cache is checkpointed every 5 minutes, so a crash does not lose it (nmzik, with fxpw) | 959bee47        |
-| Partly: the Vulkan pipeline cache is kept across emulator builds (part of a performance commit; shadowbeat070) | d58aefde        |
-| Partly: guest buffers with device addresses share VMA blocks instead of one dedicated allocation each (part of a performance commit; shadowbeat070) | d58aefde        |
-| Partly: virtual memory range edits use an ordered map instead of shifting the whole range list (nmzik) | f7ae86c9        |
-
-
-## Known bugs and crashes
-
-- **Occasional crash after switching to Fidelity mid-game**: changing the graphics mode in
-Settings from Performance to Fidelity sometimes exits with "MaterializeResources" shortly after.
-Loading a save that is already in Fidelity mode works.
-- **Flickering character models after switching from Fidelity to Performance**: the player's and
-NPCs' models sometimes keep flickering between brightness levels after the graphics mode is
-changed from Fidelity to Performance mid-game. Hard to reproduce.
-- **AMD GPUs**: the log warns "format Bc5UnormBlock does not support storage access;
-block-compressed textures written by the guest will not render".
-- **Performance**: Performance mode runs at 45-60 fps in the city and 60 fps in open places,
-with short hitches while the game streams new areas. Fidelity mode is much
-slower (about 3-9 fps): its ray tracing BVH is rebuilt every frame by a long chain of compute dispatches, and
-the emulated GPU waits for each step on the host GPU.
-- **First Fidelity session waits for shader compilation**: the first time ray tracing starts,
-the driver compiles its large ray tracing shaders (about 3-7 s each, 15-25 s in total). Later
-sessions create these pipelines while the game loads.
-
-## Screenshots
-
-![Boot legal notice](ForkImgs/1.png)
-
-![Franklin in Los Santos](ForkImgs/2.png)
-
-## New prologue video with pipeline cache **empty** at 60 fps!!
-
-- v6 compiles the shaders in background without freeze the image and show the models when they are ready, the game is running in 2k resolution
-
-[![Video](https://img.youtube.com/vi/AXGfUv167Gs/maxresdefault.jpg)](https://youtu.be/AXGfUv167Gs)
-
-## 30 min gameplay video 60 fps stable at 2k resolution with v9 release
-
-[![Video](https://img.youtube.com/vi/ABnoxSQLzBQ/maxresdefault.jpg)](https://youtu.be/ABnoxSQLzBQ)
-
-## Reporting a problem
-
-Open an issue with the crash message, the game mode (Performance, Performance RT or Fidelity) and
-where in the game it happened. Crash reports from the emulator include the faulting thread,
-registers and stack, which are usually enough to locate the problem.
+[TheCruZ](https://github.com/TheCruZ/KytyPS5-GTA), [KytyPS5](https://github.com/KytyPS5/KytyPS5)
+e os autores dos commits trazidos de outros forks: AN0DIN, carbonimax, EmK530, fxpw, NeySlim,
+nmzik e romainhedouin. As estatísticas de shader foram feitas com a DeepSeek.
